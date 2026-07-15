@@ -1,0 +1,51 @@
+/*
+ESPTimeCast™
+Copyright (c) 2026 M-Factory (mfactory-osaka)
+All rights reserved.
+
+LICENSE: Source-available for personal, non-commercial use only.
+
+PERMISSION GRANTED:
+- To use and modify this software for private, non-commercial projects.
+- To fork this repository solely for personal, non-commercial modification, provided that:
+    - The fork remains private and is not publicly accessible;
+    - This license is retained in full in any fork or derivative work;
+    - No modified or unmodified versions are redistributed in any form.
+- Personal use includes display in a home, personal workspace, hobby environment,
+  or in a physical location (e.g., home, office, shop, or public space),
+  provided the software itself is not sold, licensed, or used as part of a
+  commercial offering.
+- Sharing photos or videos of the software in use is permitted,
+  provided clear credit to "ESPTimeCast™ by M-Factory" is given
+  in any public post, listing, or publication.
+
+STRICTLY PROHIBITED:
+- Use in any commercial product or service, or for revenue-generating purposes.
+- Manufacturing, selling, or distributing hardware devices preloaded with this software.
+- Resale, redistribution, or sublicensing of the software (modified or original).
+- Inclusion in any paid hardware/software bundles or commercial offerings.
+- Distribution of this software (modified or unmodified) on maker platforms,
+  file-sharing sites, or repositories (e.g., Printables, MakerWorld, Cults3D),
+  whether free or monetized.
+- Presenting this software or its visual output as your own work,
+  or failing to provide proper attribution in public or online posts.
+- Removing or replacing this license in forks or derivative works.
+
+---------------------------------------------------------------------------
+DISCLAIMER: THIS SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+
+LIMITATION OF LIABILITY: IN NO EVENT SHALL M-FACTORY OR THE AUTHORS BE LIABLE
+FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR
+THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+---------------------------------------------------------------------------
+
+COMMERCIAL LICENSING:
+For inquiries regarding commercial use or volume distribution, contact:
+mario.felipe.tf@gmail.com
+
+NOTE: This software is NOT "Open Source" under OSI definitions.
+By using this software, you agree to the full terms in LICENSE.txt.
+*/
