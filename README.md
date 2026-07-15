@@ -12,7 +12,7 @@
 🎉 **1,400+ GitHub stars - thank you to the community!**  
 
 **ESPTimeCast™** is a sleek, WiFi-connected LED matrix clock and weather display built on **ESP8266/ESP32** and **MAX7219**.
-It combines real-time NTP time sync, live OpenWeatherMap updates, and a modern web-based configuration interface — all in one compact design.
+It combines real-time NTP time sync, selectable Open-Meteo/OpenWeatherMap updates, and a modern web-based configuration interface — all in one compact design.
 
 
 <video src="https://github.com/user-attachments/assets/78b6525d-8dcd-43fc-875e-28805e0f4fab"></video>
@@ -168,7 +168,7 @@ Advanced and developer-focused information is available below.
 - **8x32 LED Matrix Display** powered by MAX7219 with custom font support  
 - **Web-Based Configuration** – no apps required, configure everything from your browser  
 - **Accurate Time Sync (NTP)** with automatic retries and status feedback  
-- **Live Weather Updates** from OpenWeatherMap (temperature, humidity, conditions)  
+- **Live Weather Updates** from Open-Meteo or OpenWeatherMap (temperature, humidity, conditions)
 - **Custom Scroll Messages** with persistent display control  
 - **Countdowns & Timers** – create event countdowns with custom messages or run quick timers (e.g. 15 min)  
 - **OTA Firmware Updates** – update your device directly from the browser, no reflashing required
@@ -280,7 +280,7 @@ mDNS / Bonjour - Works on macOS, iOS, Windows with Bonjour, and most modern brow
 
 #### The Web UI gives you control over:
 - **WiFi settings** (SSID & Password)
-- **Weather settings** (OpenWeatherMap API key, City, Country, Coordinates)
+- **Weather settings** (Open-Meteo coordinates or OpenWeatherMap API key and location)
 - **Time zone** (will auto-populate if TZ is found)
 - **Day of the Week and Weather Description** languages
 - **Display durations** for clock and weather (milliseconds)
@@ -318,12 +318,15 @@ Click the **cog icon** next to “Advanced Settings” in the Web UI to reveal e
 
 >Non-English characters converted to their closest English alphabet.   
 >For Esperanto, Irish, and Swahili, weather description translations are not available. Japanese translations exist, but since the device cannot display all Japanese characters, English will be used in all these cases.  
+>Open-Meteo condition descriptions currently use concise English WMO labels; OpenWeatherMap retains provider-supplied translations.
 
 > **Tip:** Don't forget to press the save button to keep your settings
 
 &nbsp;
 ## 📝 Configuration Notes
 
+- **Weather Provider:** Open-Meteo needs latitude/longitude and no API key. OpenWeatherMap remains available for existing configurations.
+- **Open-Meteo Attribution:** Weather data by [Open-Meteo.com](https://open-meteo.com/) under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/).
 - **OpenWeatherMap API Key:**
    - [Make an account here](https://home.openweathermap.org/users/sign_up)
    - [Check your API key here](https://home.openweathermap.org/api_keys)
@@ -1111,7 +1114,7 @@ http://your-device-ip/upload
 **ESPTimeCast™** automatically switches between two display modes: Clock and Weather.
 If "Show Weather Description" is enabled, a third mode (Description) will display with a duration of 3 seconds, if the description is too long to fit on the display the description will scroll from right to left once.
 
-What you see on the LED matrix depends on whether the device has successfully fetched the current time (via NTP) and weather (via OpenWeatherMap).  
+What you see on the LED matrix depends on whether the device has successfully fetched current time via NTP and weather from the selected provider.
 The following table summarizes what will appear on the display in each scenario:
 
 | Display Mode | 🕒 NTP Time | 🌦️ Weather Data | 📺 Display Output                              |
@@ -1133,7 +1136,7 @@ The following table summarizes what will appear on the display in each scenario:
 **Legend:**
 - 🗓️ **Day Icon**: Custom symbol for day of week (`@`, `=`, etc.)
 - ⏰ **Time**: Current time (HH:MM)
-- 🌡️ **Temperature**: Weather from OpenWeatherMap
+- 🌡️ **Temperature**: Weather from selected provider
 - ✅ **Yes**: Data available
 - ❌ **No**: Data not available
 - — : Value does not affect this mode

@@ -118,6 +118,9 @@ char password[64] = "";
 char openWeatherApiKey[64] = "";
 char openWeatherCity[64] = "";
 char openWeatherCountry[64] = "";
+char weatherProvider[20] = "openmeteo";
+char weatherLatitude[24] = "";
+char weatherLongitude[24] = "";
 char weatherUnits[12] = "metric";
 char timeZone[64] = "";
 char language[8] = "en";
@@ -198,6 +201,8 @@ DNSServer dnsServer;
 bool rotationEnabled = true;
 
 String currentTemp = "";
+String apparentTemperature = "";
+int currentWeatherCode = -1;
 String weatherDescription = "";
 String weatherIcon = "";
 bool showWeatherDescription = false;
@@ -308,6 +313,7 @@ void setupButtons();
 bool isModeAvailable(int mode);
 bool saveCountdownConfig(bool enabled, time_t targetTimestamp, const String &label);
 bool saveConfigRuntime();
+bool weatherConfigurationValid();
 void showTimerMode7();
 
 // --- Safe WiFi credential and API getters ---
@@ -333,6 +339,15 @@ const char *getSafeApiKey() {
   } else {
     return "********************************";  // Always masked, even in AP mode
   }
+}
+
+bool weatherConfigurationValid() {
+  const WeatherProvider provider = parseWeatherProvider(String(weatherProvider));
+  if (provider == WeatherProvider::OpenMeteo) {
+    return validWeatherCoordinates(String(weatherLatitude), String(weatherLongitude));
+  }
+  return strlen(openWeatherApiKey) == 32 &&
+         strlen(openWeatherCity) > 0 && strlen(openWeatherCountry) > 0;
 }
 
 // Scroll flipped
@@ -365,6 +380,9 @@ void loadConfig() {
     doc[F("openWeatherCity")] = "";
     doc[F("openWeatherCountry")] = "";
     doc[F("weatherUnits")] = "metric";
+    doc[F("weatherProvider")] = "openmeteo";
+    doc[F("weatherLatitude")] = "";
+    doc[F("weatherLongitude")] = "";
     doc[F("clockDuration")] = 10000;
     doc[F("weatherDuration")] = 5000;
     doc[F("timeZone")] = "";
@@ -444,6 +462,34 @@ void loadConfig() {
   strlcpy(openWeatherCity, doc["openWeatherCity"] | "", sizeof(openWeatherCity));
   strlcpy(openWeatherCountry, doc["openWeatherCountry"] | "", sizeof(openWeatherCountry));
   strlcpy(weatherUnits, doc["weatherUnits"] | "metric", sizeof(weatherUnits));
+
+  if (doc["weatherProvider"].is<const char *>()) {
+    const String storedProvider = doc["weatherProvider"].as<String>();
+    const WeatherProvider provider = parseWeatherProvider(storedProvider);
+    strlcpy(weatherProvider, weatherProviderName(provider), sizeof(weatherProvider));
+    if (storedProvider != weatherProvider) {
+      doc["weatherProvider"] = weatherProvider;
+      configChanged = true;
+      Serial.println(F("[CONFIG] Normalized invalid weather provider."));
+    }
+  } else {
+    // Existing installations keep OpenWeatherMap until user explicitly switches.
+    strlcpy(weatherProvider, "openweathermap", sizeof(weatherProvider));
+    doc["weatherProvider"] = weatherProvider;
+    configChanged = true;
+    Serial.println(F("[CONFIG] Migrated: preserving OpenWeatherMap provider."));
+  }
+  strlcpy(weatherLatitude, doc["weatherLatitude"] | "", sizeof(weatherLatitude));
+  strlcpy(weatherLongitude, doc["weatherLongitude"] | "", sizeof(weatherLongitude));
+  if (!validWeatherCoordinates(String(weatherLatitude), String(weatherLongitude)) &&
+      validWeatherCoordinates(String(openWeatherCity), String(openWeatherCountry))) {
+    strlcpy(weatherLatitude, openWeatherCity, sizeof(weatherLatitude));
+    strlcpy(weatherLongitude, openWeatherCountry, sizeof(weatherLongitude));
+    doc["weatherLatitude"] = weatherLatitude;
+    doc["weatherLongitude"] = weatherLongitude;
+    configChanged = true;
+    Serial.println(F("[CONFIG] Migrated legacy weather coordinates."));
+  }
   strlcpy(customMessage, doc["customMessage"] | "", sizeof(customMessage));
   strlcpy(lastPersistentMessage, customMessage, sizeof(lastPersistentMessage));
   clockDuration = doc["clockDuration"] | 10000;
@@ -830,6 +876,10 @@ void printConfigToSerial() {
   Serial.println(openWeatherCountry);
   Serial.print(F("OpenWeather API Key: "));
   Serial.println(openWeatherApiKey);
+  Serial.print(F("Weather Provider: "));
+  Serial.println(weatherProvider);
+  Serial.print(F("Weather Latitude/Longitude: "));
+  Serial.printf("%s, %s\n", weatherLatitude, weatherLongitude);
   Serial.print(F("Temperature Unit: "));
   Serial.println(weatherUnits);
   Serial.print(F("Clock duration: "));
@@ -1316,7 +1366,14 @@ void setupWebServer() {
 
   // Root handler with BOTH CORS and Cache-Prevention
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
-    AsyncWebServerResponse *response = request->beginResponse(200, "text/html", index_html);
+    AsyncWebServerResponse *response = request->beginResponse(
+      "text/html", sizeof(index_html) - 1,
+      [](uint8_t *buffer, size_t maxLength, size_t index) -> size_t {
+        const size_t remaining = sizeof(index_html) - 1 - index;
+        const size_t length = remaining < maxLength ? remaining : maxLength;
+        memcpy_P(buffer, index_html + index, length);
+        return length;
+      });
     // Anti-Caching Headers: Ensures the browser always fetches the latest UI
     response->addHeader("Cache-Control", "no-cache, no-store, must-revalidate");
     response->addHeader("Pragma", "no-cache");
@@ -1952,6 +2009,9 @@ void setupWebServer() {
     weather["sunriseMinute"] = weatherAvailable ? sunriseMinute : JsonVariant();
     weather["sunsetHour"] = weatherAvailable ? sunsetHour : JsonVariant();
     weather["sunsetMinute"] = weatherAvailable ? sunsetMinute : JsonVariant();
+    weather["apparentTemperature"] = apparentTemperature.length() > 0 ? String(apparentTemperature).toInt() : JsonVariant();
+    weather["weatherCode"] = currentWeatherCode >= 0 ? currentWeatherCode : JsonVariant();
+    weather["provider"] = String(weatherProvider);
 
     // --- Nightscout info ---
 #if defined(ESP32) || defined(ESP8266)
@@ -1994,6 +2054,9 @@ void setupWebServer() {
     config["openWeatherApiKey"] = (strlen(openWeatherApiKey) > 0) ? "***HIDDEN***" : "";
     config["openWeatherCity"] = String(openWeatherCity);
     config["weatherUnits"] = String(weatherUnits);
+    config["weatherProvider"] = String(weatherProvider);
+    config["weatherLatitude"] = String(weatherLatitude);
+    config["weatherLongitude"] = String(weatherLongitude);
     config["clockDuration"] = clockDuration;
     config["weatherDuration"] = weatherDuration;
     config["timeZone"] = String(timeZone);
@@ -3335,6 +3398,9 @@ void setup() {
   initialWeather.detailedDescription = detailedDesc;
   initialWeather.icon = weatherIcon;
   initialWeather.humidity = currentHumidity;
+  initialWeather.apparentTemperature = apparentTemperature;
+  initialWeather.weatherCode = currentWeatherCode;
+  initialWeather.provider = weatherProvider;
   initialWeather.sunriseHour = sunriseHour;
   initialWeather.sunriseMinute = sunriseMinute;
   initialWeather.sunsetHour = sunsetHour;
@@ -3581,7 +3647,7 @@ bool isModeAvailable(int mode) {
   SnsType snsType = detectSnsType(String(ntpServer2));
   switch (mode) {
     case 0: return true;  // CLOCK always available
-    case 1: return weatherAvailable && strlen(openWeatherApiKey) == 32 && strlen(openWeatherCity) > 0 && strlen(openWeatherCountry) > 0;
+    case 1: return weatherAvailable && weatherConfigurationValid();
     case 2: return showWeatherDescription && weatherAvailable && weatherDescription.length() > 0;
     case 3: return countdownEnabled && !countdownFinished && ntpSyncSuccessful;
     case 4: return snsType != SNS_NTP;  // nightscout, youtube, or instagram all use mode 4
@@ -4035,16 +4101,25 @@ void loop() {
 
   // --- OUTBOUND DATA SERVICES ---
   static WeatherRequest weatherRequest;
-  if (weatherRequest.apiKey != openWeatherApiKey ||
+  const WeatherProvider configuredProvider = parseWeatherProvider(String(weatherProvider));
+  if (weatherRequest.provider != configuredProvider ||
+      weatherRequest.apiKey != openWeatherApiKey ||
       weatherRequest.city != openWeatherCity ||
       weatherRequest.country != openWeatherCountry ||
+      weatherRequest.latitude != weatherLatitude ||
+      weatherRequest.longitude != weatherLongitude ||
       weatherRequest.units != weatherUnits ||
-      weatherRequest.language != language) {
+      weatherRequest.language != language ||
+      weatherRequest.timezone != timeZone) {
+    weatherRequest.provider = configuredProvider;
     weatherRequest.apiKey = openWeatherApiKey;
     weatherRequest.city = openWeatherCity;
     weatherRequest.country = openWeatherCountry;
+    weatherRequest.latitude = weatherLatitude;
+    weatherRequest.longitude = weatherLongitude;
     weatherRequest.units = weatherUnits;
     weatherRequest.language = language;
+    weatherRequest.timezone = timeZone;
   }
   static String snsSource;
   if (snsSource != ntpServer2) snsSource = ntpServer2;
@@ -4058,6 +4133,8 @@ void loop() {
     if (weather.fetched) {
       currentTemp = weather.temperature;
       currentHumidity = weather.humidity;
+      apparentTemperature = weather.apparentTemperature;
+      currentWeatherCode = weather.weatherCode;
       mainDesc = weather.mainDescription;
       detailedDesc = weather.detailedDescription;
       weatherIcon = weather.icon;
@@ -4320,7 +4397,7 @@ void loop() {
     String desc = weatherDescription;
 
     // --- Check if humidity is actually visible ---
-    bool humidityVisible = showHumidity && weatherAvailable && strlen(openWeatherApiKey) == 32 && strlen(openWeatherCity) > 0 && strlen(openWeatherCountry) > 0;
+    bool humidityVisible = showHumidity && weatherAvailable && weatherConfigurationValid();
 
     // --- Conditional padding ---
     bool addPadding = false;
@@ -4652,7 +4729,7 @@ void loop() {
 
         String fullString = String(buf);
         bool addPadding = false;
-        bool humidityVisible = showHumidity && weatherAvailable && strlen(openWeatherApiKey) == 32 && strlen(openWeatherCity) > 0 && strlen(openWeatherCountry) > 0;
+        bool humidityVisible = showHumidity && weatherAvailable && weatherConfigurationValid();
 
         // Padding logic
         if (prevDisplayMode == 0 && (showDayOfWeek || colonBlinkEnabled)) {
@@ -4832,7 +4909,7 @@ void loop() {
 
       // Padding logic (same as weather scroll)
       bool addPadding = false;
-      bool humidityVisible = showHumidity && weatherAvailable && strlen(openWeatherApiKey) == 32 && strlen(openWeatherCity) > 0 && strlen(openWeatherCountry) > 0;
+      bool humidityVisible = showHumidity && weatherAvailable && weatherConfigurationValid();
       if (prevDisplayMode == 0 && (showDayOfWeek || colonBlinkEnabled)) {
         addPadding = true;
       } else if (prevDisplayMode == 1 && humidityVisible) {
@@ -5142,7 +5219,7 @@ void loop() {
 
     // --- BRANCH B: SCROLLING ---
     bool addPadding = false;
-    bool humidityVisible = showHumidity && weatherAvailable && strlen(openWeatherApiKey) == 32 && strlen(openWeatherCity) > 0 && strlen(openWeatherCountry) > 0;
+    bool humidityVisible = showHumidity && weatherAvailable && weatherConfigurationValid();
     if (prevDisplayMode == 0 && (showDayOfWeek || colonBlinkEnabled)) addPadding = true;
     else if (prevDisplayMode == 1 && humidityVisible) addPadding = true;
 

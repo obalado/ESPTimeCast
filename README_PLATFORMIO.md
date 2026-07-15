@@ -122,3 +122,9 @@ platformio.ini                          Build environments and dependencies
 ```
 
 `main.cpp` is standard C++ and uses explicit forward declarations; Arduino `.ino` preprocessing is not required.
+
+## Weather providers
+
+Fresh configurations use Open-Meteo with latitude/longitude and no API key. Existing configurations retain OpenWeatherMap until changed in the web UI. Open-Meteo requests use the configured IANA clock timezone for current-day sunrise and sunset data.
+
+Weather data by [Open-Meteo.com](https://open-meteo.com/) is available under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/).

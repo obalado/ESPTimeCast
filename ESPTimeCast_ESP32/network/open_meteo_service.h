@@ -1,15 +1,12 @@
 #pragma once
 
 #include "network_result.h"
-#include "open_meteo_service.h"
-#include "openweathermap_service.h"
 #include "weather_models.h"
 
-class WeatherService {
+class OpenMeteoService {
  public:
   NetworkResult fetch(const WeatherRequest &request, WeatherData &output);
 
  private:
-  OpenMeteoService openMeteo_;
-  OpenWeatherMapService openWeatherMap_;
+  String buildUrl(const WeatherRequest &request) const;
 };

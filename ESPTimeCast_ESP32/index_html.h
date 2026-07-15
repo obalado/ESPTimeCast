@@ -1140,41 +1140,57 @@ const char index_html[] PROGMEM = R"rawliteral(
       </div>
 
       <h2 class="no-ap">Weather Settings</h2>
-      <label class="no-ap" for="openWeatherApiKey">OpenWeather API Key</label>
-      <input
-        class="no-ap"
-        type="text"
-        id="openWeatherApiKey"
-        name="openWeatherApiKey"
-        placeholder="ADD-YOUR-API-KEY-32-CHARACTERS"
-      />
-      <div class="small no-ap">
-        Required to fetch weather data.
-        <a href="https://home.openweathermap.org/users/sign_up" target="_blank"
-          >Get your API key here</a
-        >.
+      <div class="no-ap">
+        <label for="weatherProvider">Weather Provider</label>
+        <select id="weatherProvider" name="weatherProvider">
+          <option value="openmeteo">Open-Meteo</option>
+          <option value="openweathermap">OpenWeatherMap</option>
+        </select>
       </div>
 
-      <label class="no-ap">Location</label>
-      <div class="form-row two-col no-ap">
-        <input
-          type="text"
-          id="openWeatherCity"
-          name="openWeatherCity"
-          placeholder="City / Zip / Lat."
-        />
-        <input
-          type="text"
-          id="openWeatherCountry"
-          name="openWeatherCountry"
-          placeholder="Country Code / Long."
-        />
+      <div id="openMeteoSettings" class="no-ap">
+        <label>Open-Meteo Coordinates</label>
+        <div class="form-row two-col">
+          <input type="text" id="weatherLatitude" name="weatherLatitude" placeholder="Latitude (e.g. -33.036)" />
+          <input type="text" id="weatherLongitude" name="weatherLongitude" placeholder="Longitude (e.g. -71.6296)" />
+        </div>
+        <div class="small">
+          No API key required. Times use configured clock timezone.
+          Weather data by <a href="https://open-meteo.com/" target="_blank">Open-Meteo.com</a>.
+        </div>
       </div>
 
-      <div class="small no-ap">
-        <strong>Location format examples:</strong> City, Country Code - Osaka,
-        JP | ZIP, Country Code - 94040, US | Latitude, Longitude - 34.6937,
-        135.5023
+      <div id="openWeatherMapSettings" class="no-ap">
+        <label for="openWeatherApiKey">OpenWeatherMap API Key</label>
+        <input
+          type="text"
+          id="openWeatherApiKey"
+          name="openWeatherApiKey"
+          placeholder="ADD-YOUR-API-KEY-32-CHARACTERS"
+        />
+        <div class="small">
+          Required for OpenWeatherMap.
+          <a href="https://home.openweathermap.org/users/sign_up" target="_blank">Get your API key here</a>.
+        </div>
+
+        <label>OpenWeatherMap Location</label>
+        <div class="form-row two-col">
+          <input
+            type="text"
+            id="openWeatherCity"
+            name="openWeatherCity"
+            placeholder="City / Zip / Lat."
+          />
+          <input
+            type="text"
+            id="openWeatherCountry"
+            name="openWeatherCountry"
+            placeholder="Country Code / Long."
+          />
+        </div>
+        <div class="small">
+          <strong>Examples:</strong> Osaka, JP | 94040, US | 34.6937, 135.5023
+        </div>
       </div>
 
       <button
@@ -1434,7 +1450,7 @@ const char index_html[] PROGMEM = R"rawliteral(
                   <span class="toggle-slider"></span>
                 </span>
                 <div id="autoDimmingNote" class="small">
-                  Requires a valid OpenWeather API key.
+                  Requires valid weather-provider configuration.
                 </div>
               </label>
 
@@ -1745,6 +1761,12 @@ const char index_html[] PROGMEM = R"rawliteral(
               hasSavedKey = false;
             }
 
+            document.getElementById("weatherProvider").value =
+              data.weatherProvider || "openweathermap";
+            document.getElementById("weatherLatitude").value =
+              data.weatherLatitude || "";
+            document.getElementById("weatherLongitude").value =
+              data.weatherLongitude || "";
             document.getElementById("openWeatherCity").value =
               data.openWeatherCity || "";
             document.getElementById("openWeatherCountry").value =
@@ -1804,7 +1826,7 @@ const char index_html[] PROGMEM = R"rawliteral(
             autoDimmingEl.checked = isAutoDimming;
             dimmingEnabledEl.checked = isCustomDimming;
 
-            setDimmingFieldsEnabled();
+            updateWeatherProviderUi();
 
             initClockOnlyDuringDimming(data);
 
@@ -2664,12 +2686,19 @@ const char index_html[] PROGMEM = R"rawliteral(
         };
 
         const setFields = (lat, lon, label) => {
-          if (lat) document.getElementById("openWeatherCity").value = lat;
-          if (lon) document.getElementById("openWeatherCountry").value = lon;
+          if (lat) {
+            document.getElementById("weatherLatitude").value = lat;
+            document.getElementById("openWeatherCity").value = lat;
+          }
+          if (lon) {
+            document.getElementById("weatherLongitude").value = lon;
+            document.getElementById("openWeatherCountry").value = lon;
+          }
           const btn = document.getElementById("geo-button");
           btn.textContent = "Location: " + (label || "Location Found");
           btn.disabled = true;
           btn.classList.add("geo-disabled");
+          setDimmingFieldsEnabled();
         };
 
         try {
@@ -2706,7 +2735,7 @@ const char index_html[] PROGMEM = R"rawliteral(
               "Possible causes:\n" +
               "- CORS blocking in browser (try server-side)\n" +
               "- Network issue or rate limit\n\n" +
-              "You can manually search for coordinates on https://openweathermap.org/find",
+              "You can enter latitude and longitude manually.",
           );
         }
       }
@@ -2918,9 +2947,28 @@ const char index_html[] PROGMEM = R"rawliteral(
           });
       }
 
-      // --- Dimming Controls Logic (The correct version) ---
+      function validOpenMeteoCoordinates() {
+        const latitude = document.getElementById("weatherLatitude").value.trim();
+        const longitude = document.getElementById("weatherLongitude").value.trim();
+        if (latitude === "" || longitude === "") return false;
+        const lat = Number(latitude);
+        const lon = Number(longitude);
+        return Number.isFinite(lat) && Number.isFinite(lon) &&
+          lat >= -90 && lat <= 90 && lon >= -180 && lon <= 180;
+      }
+
+      function updateWeatherProviderUi() {
+        const provider = document.getElementById("weatherProvider").value;
+        document.getElementById("openMeteoSettings").style.display =
+          provider === "openmeteo" ? "block" : "none";
+        document.getElementById("openWeatherMapSettings").style.display =
+          provider === "openweathermap" ? "block" : "none";
+        setDimmingFieldsEnabled();
+      }
+
       function setDimmingFieldsEnabled() {
         const apiKeyField = document.getElementById("openWeatherApiKey");
+        const providerField = document.getElementById("weatherProvider");
         const autoDimming = document.getElementById("autoDimmingEnabled");
         const dimmingEnabled = document.getElementById("dimmingEnabled");
         const dimStart = document.getElementById("dimStartTime");
@@ -2928,67 +2976,45 @@ const char index_html[] PROGMEM = R"rawliteral(
         const dimBrightness = document.getElementById("dimBrightness");
         const noteEl = document.getElementById("autoDimmingNote");
 
-        if (!apiKeyField || !autoDimming || !dimmingEnabled) return;
+        if (!apiKeyField || !providerField || !autoDimming || !dimmingEnabled) return;
 
         const currentApiKeyInput = apiKeyField.value.trim();
-        // Checks if a key is saved (hasSavedKey) OR if the user is currently typing a new one.
-        const isKeyPresent =
-          hasSavedKey ||
+        const keyPresent = hasSavedKey ||
           (currentApiKeyInput !== "" && currentApiKeyInput !== MASK);
+        const weatherConfigured = providerField.value === "openmeteo"
+          ? validOpenMeteoCoordinates()
+          : keyPresent;
 
-        // --- 1. Control Auto Dimming based on Key Presence ---
-        // Meets requirement: "when page load after autodim has been saved to json,
-        // if user removes the api key (masked) the toggle auto dim toggle should get disabled"
-        if (!isKeyPresent) {
+        if (!weatherConfigured) {
           autoDimming.checked = false;
           autoDimming.disabled = true;
-          if (noteEl) noteEl.style.display = "block";
+          if (noteEl) {
+            noteEl.textContent = providerField.value === "openmeteo"
+              ? "Requires valid Open-Meteo coordinates."
+              : "Requires a valid OpenWeatherMap API key.";
+            noteEl.style.display = "block";
+          }
         } else {
           autoDimming.disabled = false;
           if (noteEl) noteEl.style.display = "none";
         }
 
-        // Custom Dimming toggle is always enabled (since it's not key-dependent)
         dimmingEnabled.disabled = false;
-
-        // --- 2. Control Dependent Fields based on Active Mode ---
-
-        const isAutoDimmingActive = autoDimming.checked && isKeyPresent; // Auto is only active if checked AND key is present
+        const isAutoDimmingActive = autoDimming.checked && weatherConfigured;
         const isCustomDimmingActive = dimmingEnabled.checked;
-        const isDimmingActive = isAutoDimmingActive || isCustomDimmingActive; // Brightness slider logic
+        const isDimmingActive = isAutoDimmingActive || isCustomDimmingActive;
 
-        // --- Update Clock-only-during-dimming checkbox state (if present) ---
         const clockOnlyEl = document.getElementById("clockOnlyDuringDimming");
         if (clockOnlyEl) {
-          // Read current brightness control value (string)
-          const dbEl = document.getElementById("dimBrightness");
-          const dbVal = dbEl ? dbEl.value : null;
-          const dbOk =
-            dbVal !== null
-              ? !(
-                  String(dbVal).toLowerCase() === "off" ||
-                  String(dbVal) === "-1"
-                )
-              : true;
-          const currentlyDimEnabled =
-            isAutoDimmingActive || isCustomDimmingActive;
-          clockOnlyEl.disabled = !currentlyDimEnabled || !dbOk;
+          const dbVal = dimBrightness ? dimBrightness.value : null;
+          const dbOk = dbVal === null ||
+            (String(dbVal).toLowerCase() !== "off" && String(dbVal) !== "-1");
+          clockOnlyEl.disabled = !isDimmingActive || !dbOk;
         }
 
-        // BRIGHTNESS SLIDER: Enabled if EITHER mode is active.
-        if (dimBrightness) {
-          dimBrightness.disabled = !isDimmingActive;
-        }
-
-        // START/END TIME FIELDS: Enabled ONLY if Custom Dimming is checked (key not needed).
-        const isCustomTimeEnabled = dimmingEnabled.checked;
-        if (dimStart) {
-          dimStart.disabled = !isCustomTimeEnabled;
-        }
-        if (dimEnd) {
-          dimEnd.disabled = !isCustomTimeEnabled;
-        }
-
+        if (dimBrightness) dimBrightness.disabled = !isDimmingActive;
+        if (dimStart) dimStart.disabled = !dimmingEnabled.checked;
+        if (dimEnd) dimEnd.disabled = !dimmingEnabled.checked;
         clearClockOnlyIfNoDimming();
       }
 
@@ -3023,6 +3049,9 @@ const char index_html[] PROGMEM = R"rawliteral(
         const apiKeyEl = document.getElementById("openWeatherApiKey");
         const autoEl = document.getElementById("autoDimmingEnabled");
         const dimEl = document.getElementById("dimmingEnabled");
+        const providerEl = document.getElementById("weatherProvider");
+        const latitudeEl = document.getElementById("weatherLatitude");
+        const longitudeEl = document.getElementById("weatherLongitude");
 
         if (apiKeyEl) {
           apiKeyEl.addEventListener("input", setDimmingFieldsEnabled);
@@ -3030,6 +3059,10 @@ const char index_html[] PROGMEM = R"rawliteral(
         }
         if (autoEl) autoEl.addEventListener("change", setDimmingFieldsEnabled);
         if (dimEl) dimEl.addEventListener("change", setDimmingFieldsEnabled);
+        if (providerEl) providerEl.addEventListener("change", updateWeatherProviderUi);
+        if (latitudeEl) latitudeEl.addEventListener("input", setDimmingFieldsEnabled);
+        if (longitudeEl) longitudeEl.addEventListener("input", setDimmingFieldsEnabled);
+        updateWeatherProviderUi();
       });
 
       const ssidInput = document.getElementById("ssid");

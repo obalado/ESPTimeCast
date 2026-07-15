@@ -9,11 +9,15 @@ void NetworkDataCoordinator::initialize(const WeatherData &weatherData) {
 }
 
 void NetworkDataCoordinator::configure(const WeatherRequest &weatherRequest, const String &snsSource) {
-  if (weatherRequest_.apiKey != weatherRequest.apiKey ||
+  if (weatherRequest_.provider != weatherRequest.provider ||
+      weatherRequest_.apiKey != weatherRequest.apiKey ||
       weatherRequest_.city != weatherRequest.city ||
       weatherRequest_.country != weatherRequest.country ||
+      weatherRequest_.latitude != weatherRequest.latitude ||
+      weatherRequest_.longitude != weatherRequest.longitude ||
       weatherRequest_.units != weatherRequest.units ||
-      weatherRequest_.language != weatherRequest.language) {
+      weatherRequest_.language != weatherRequest.language ||
+      weatherRequest_.timezone != weatherRequest.timezone) {
     weatherRequest_ = weatherRequest;
   }
   if (snsSource_ != snsSource) snsSource_ = snsSource;
