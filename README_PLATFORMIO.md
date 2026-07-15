@@ -113,9 +113,12 @@ Device reboots automatically after successful update.
 ## Source layout
 
 ```text
-ESPTimeCast_ESP32/main.cpp    Firmware entry point
-ESPTimeCast_ESP32/*.h         Embedded UI, fonts, lookups, and version
-platformio.ini                Build environments and dependencies
+ESPTimeCast_ESP32/main.cpp             Firmware entry point and orchestration
+ESPTimeCast_ESP32/network/              Weather, Nightscout, SNS, request gating, and fetch scheduling
+ESPTimeCast_ESP32/services/             Pure feed and weather utilities
+ESPTimeCast_ESP32/storage/              Config, pin, and uptime persistence
+ESPTimeCast_ESP32/*.h                   Embedded UI, fonts, lookups, and version
+platformio.ini                          Build environments and dependencies
 ```
 
 `main.cpp` is standard C++ and uses explicit forward declarations; Arduino `.ino` preprocessing is not required.

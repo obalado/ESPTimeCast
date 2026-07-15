@@ -11,7 +11,6 @@ See LICENSE.txt for full terms.
 
 #include <Arduino.h>
 #include <WiFi.h>
-#include <HTTPClient.h>
 #include <AsyncTCP.h>
 #include <LittleFS.h>
 #include <ArduinoJson.h>
@@ -20,21 +19,22 @@ See LICENSE.txt for full terms.
 #include <SPI.h>
 #include <ESPAsyncWebServer.h>
 #include <DNSServer.h>
-#include <sntp.h>
+#include <esp_sntp.h>
 #include <time.h>
-#include <WiFiClientSecure.h>
 #include <ESPmDNS.h>
 #include <Update.h>
 #include "version.h"
 #include "mfactoryfont.h"
-#include <Preferences.h>
+#include "storage/pin_store.h"
 #include "tz_lookup.h"      // Timezone lookup, do not duplicate mapping here!
 #include "days_lookup.h"    // Languages for the Days of the Week
 #include "months_lookup.h"  // Languages for the Months of the Year
 #include "index_html.h"     // Web UI
+#include "services/sns_utils.h"
+#include "network/network_data_coordinator.h"
+#include "storage/uptime_store.h"
+#include "storage/config_store.h"
 
-#include "esp_partition.h"
-#include "nvs_flash.h"
 
 // ============================
 // LEGACY fallback pins (used ONLY for migration)
@@ -66,18 +66,13 @@ See LICENSE.txt for full terms.
 #define HARDWARE_TYPE MD_MAX72XX::FC16_HW
 #define MAX_DEVICES 4
 
-#ifdef ESP8266
-WiFiEventHandler mConnectHandler;
-WiFiEventHandler mDisConnectHandler;
-WiFiEventHandler mGotIpHandler;
-#endif
 
-Preferences prefs;
 int CLK_PIN;
 int CS_PIN;
 int DATA_PIN;
 MD_Parola P = MD_Parola(HARDWARE_TYPE, L_DATA, L_CLK, L_CS, MAX_DEVICES);
 AsyncWebServer server(80);
+NetworkDataCoordinator networkData;
 
 // --- Global Scroll Speed Settings ---
 const int GENERAL_SCROLL_SPEED = 85;  // Default: Adjust this for Weather Description and Countdown Label (e.g., 50 for faster, 200 for slower)
@@ -99,77 +94,16 @@ const uint8_t modeOrder[] = {
 const uint8_t MODE_COUNT = sizeof(modeOrder) / sizeof(modeOrder[0]);
 uint8_t modeIndex = 0;
 
-// --- Nightscout setting ---
-const unsigned int NIGHTSCOUT_IDLE_THRESHOLD_MIN = 10;  // minutes before data is considered outdated
-unsigned long lastNightscoutFetchTime = 0;
-unsigned long nightscoutBackoffUntil = 0;                // millis() deadline for 404/429 backoff
-const unsigned long NIGHTSCOUT_FETCH_INTERVAL = 150000;  // 2.5 minutes
+// --- Network data snapshots used by display and status APIs ---
+const unsigned int NIGHTSCOUT_IDLE_THRESHOLD_MIN = 10;
 int currentGlucose = -1;
 String currentDirection = "?";
-time_t lastGlucoseTime = 0;  // store timestamp from JSON
-bool isNetworkBusy = false;
+time_t lastGlucoseTime = 0;
 bool nightscoutMmol = false;
-int nightscoutFailCount = 0;
-
-// --- SNS (YouTube / Instagram) sniffing & settings ---
-enum SnsType { SNS_NTP,
-               SNS_NIGHTSCOUT,
-               SNS_YOUTUBE,
-               SNS_INSTAGRAM,
-               SNS_RSS };
-
-SnsType detectSnsType(const String &val) {
-  if (val.indexOf("youtube.com") != -1 || val.indexOf("youtu.be") != -1) return SNS_YOUTUBE;
-  if (val.indexOf("instagram.com") != -1) return SNS_INSTAGRAM;
-  // Strip query string before extension-based checks so ?show_every=N doesn't fool endsWith
-  String pathOnly = val;
-  int qPos = pathOnly.indexOf('?');
-  if (qPos != -1) pathOnly = pathOnly.substring(0, qPos);
-  // RSS sniff: common feed path patterns, checked before the Nightscout https:// catch-all
-  if (val.indexOf("feed") != -1 || val.indexOf("/rss") != -1 || val.indexOf("/atom") != -1 || pathOnly.endsWith(".rss") || pathOnly.endsWith(".atom") || pathOnly.endsWith(".xml")) return SNS_RSS;
-  if (val.startsWith("https://")) return SNS_NIGHTSCOUT;
-  return SNS_NTP;
-}
-// Strips a named query param from a URL. Handles all positions:
-//   ?only=v  →  (empty)
-//   ?p=v&rest  →  ?rest
-//   ?first=x&p=v  →  ?first=x
-//   ?first=x&p=v&rest  →  ?first=x&rest
-String stripUrlParam(String url, const String &paramName) {
-  String needle = paramName + "=";
-  int idx = url.indexOf(needle);
-  if (idx == -1) return url;
-  int valEnd = url.indexOf('&', idx + needle.length());
-  char before = (idx > 0) ? url.charAt(idx - 1) : 0;
-  if (before == '?' || before == '&') idx--;  // step back to include the delimiter
-  if (valEnd == -1) {
-    url.remove(idx);  // last (or only) param: chop from here
-  } else if (before == '?') {
-    url.remove(idx + 1, valEnd - idx);  // ?param=v&rest  →  ?rest
-  } else {
-    url.remove(idx, valEnd - idx);  // &param=v&rest  →  &rest
-  }
-  return url;
-}
-
-// Returns the value of show_every=N from a URL, or 1 if not present.
-int parseBridgeShowEvery(const String &url) {
-  int idx = url.indexOf("show_every=");
-  if (idx == -1) return 1;
-  String valStr = url.substring(idx + 11);
-  int end = valStr.indexOf('&');
-  if (end != -1) valStr = valStr.substring(0, end);
-  valStr.trim();
-  int val = valStr.toInt();
-  return (val >= 1) ? val : 1;
-}
-
-const unsigned long SNS_FETCH_INTERVAL = 3600000UL;  // 1 hour
-unsigned long lastSnsFetchTime = 0;
 long youtubeSubscribers = -1;
 long instagramFollowers = -1;
 String rssTitle = "";
-int BRIDGE_SHOW_EVERY = 3;  // Show RSS every N rotations, overridable via show_every=N in URL
+int BRIDGE_SHOW_EVERY = 3;
 int bridgeRotationCount = 0;
 
 // --- Device identity ---
@@ -246,16 +180,15 @@ bool isDramaticCountdown = true;      // Default to the dramatic countdown mode
 int countdownSegment = 0;
 unsigned long segmentStartTime = 0;
 
-// Runtime Uptime Tracker
-unsigned long bootMillis = 0;                      // Stores millis() at boot
-unsigned long lastUptimeLog = 0;                   // Timer for hourly logging
-const unsigned long uptimeLogInterval = 600000UL;  // 10 minutes in ms
-unsigned long totalUptimeSeconds = 0;              // Persistent accumulated uptime in seconds
+// Runtime uptime persistence timer
+unsigned long lastUptimeLog = 0;
 
-// Unified OTA Control Variables
-bool isUpdating = false;         // When true, all background tasks (Weather, NTP, Scroll) stop
-bool pendingRestart = false;     // Flag to trigger a safe reboot in the loop
-unsigned long restartTimer = 0;  // Timer to give the WebServer time to send the final "OK"
+struct OtaState {
+  bool updating = false;
+  bool restartPending = false;
+  unsigned long restartRequestedAt = 0;
+};
+OtaState otaState;
 
 // State management
 bool weatherCycleStarted = false;
@@ -270,10 +203,8 @@ String weatherIcon = "";
 bool showWeatherDescription = false;
 bool weatherAvailable = false;
 bool weatherFetched = false;
-bool weatherFetchInitiated = false;
 bool isAPMode = false;
 char tempSymbol = '\006';
-bool shouldFetchWeatherNow = false;
 
 unsigned long lastSwitch = 0;
 unsigned long lastColonBlink = 0;
@@ -354,10 +285,6 @@ unsigned long pomodoroLongBreakMs = 15 * 60000UL;  // default 15 min
 int global_scrolltimes = 0;  // Persisted from HTTP request
 int global_msgSeconds = 0;
 
-// --- Donation / Encouragement Message ---
-bool hideDonationMsg = false;    // true = user opted out (or is an existing customer)
-bool donationFirstBoot = false;  // true only on a fresh install (no prior config.json)
-time_t nextDonationTime = 0;     // Unix timestamp for next scheduled message
 
 // --- Configurable Buttons (4x, stored in config.json) ---
 struct BtnCfg {
@@ -375,12 +302,6 @@ void goToMode(const String &target);
 bool handlePomodoroCommand(String cmd);
 bool handleTimerCommand(String cmd);
 String cleanTextForDisplay(String str);
-void saveCustomMessageToConfig(const char *msg);
-void saveUptime();
-unsigned long getTotalRuntimeSeconds();
-String formatTotalRuntime();
-String formatUptime(unsigned long seconds);
-char getWeatherIconChar(const String &iconCode);
 void executeAction(const String &action, const String &value);
 void handleBrightnessChange(int newBrightness, bool isFromUI);
 void setupButtons();
@@ -437,7 +358,7 @@ void loadConfig() {
   // Check if config.json exists, if not, create default
   if (!LittleFS.exists("/config.json")) {
     Serial.println(F("[CONFIG] config.json not found, creating with defaults..."));
-    DynamicJsonDocument doc(2048);
+    JsonDocument doc;
     doc[F("ssid")] = "";
     doc[F("password")] = "";
     doc[F("openWeatherApiKey")] = "";
@@ -475,17 +396,12 @@ void loadConfig() {
     doc[F("clockOnlyDuringDimming")] = false;
 
     // Add countdown defaults when creating a new config.json
-    JsonObject countdownObj = doc.createNestedObject("countdown");
+    JsonObject countdownObj = doc["countdown"].to<JsonObject>();
     countdownObj["enabled"] = false;
     countdownObj["targetTimestamp"] = 0;
     countdownObj["label"] = "";
     countdownObj["isDramaticCountdown"] = true;
 
-    // Fresh install: donation messages enabled, schedule for next day
-    doc[F("hideDonationMsg")] = false;
-    doc[F("nextDonationTime")] = 0;
-    donationFirstBoot = true;
-    Serial.println(F("[DONATION] Fresh install — messages enabled, will schedule for day 2."));
 
     File f = LittleFS.open("/config.json", "w");
     if (f) {
@@ -504,7 +420,7 @@ void loadConfig() {
     return;
   }
 
-  DynamicJsonDocument doc(1024);  // Size based on ArduinoJson Assistant + buffer
+  JsonDocument doc;
   DeserializationError error = deserializeJson(doc, configFile);
   configFile.close();
 
@@ -516,7 +432,7 @@ void loadConfig() {
 
   bool configChanged = false;
 
-  if (doc.containsKey("hostname")) {
+  if (doc["hostname"].is<const char *>()) {
     deviceHostname = doc["hostname"].as<String>();
     Serial.print(F("[CONFIG] Loaded hostname: "));
     Serial.println(deviceHostname);
@@ -533,7 +449,7 @@ void loadConfig() {
   clockDuration = doc["clockDuration"] | 10000;
   weatherDuration = doc["weatherDuration"] | 5000;
   strlcpy(timeZone, doc["timeZone"] | "Etc/UTC", sizeof(timeZone));
-  if (doc.containsKey("language")) {
+  if (doc["language"].is<const char *>()) {
     strlcpy(language, doc["language"], sizeof(language));
   } else {
     strlcpy(language, "en", sizeof(language));
@@ -548,7 +464,7 @@ void loadConfig() {
   showDayOfWeek = doc["showDayOfWeek"] | true;
   showDate = doc["showDate"] | false;
   showHumidity = doc["showHumidity"] | false;
-  colonBlinkEnabled = doc.containsKey("colonBlinkEnabled") ? doc["colonBlinkEnabled"].as<bool>() : true;
+  colonBlinkEnabled = doc["colonBlinkEnabled"] | true;
   showWeatherDescription = doc["showWeatherDescription"] | false;
 
   // --- Dimming settings ---
@@ -578,7 +494,7 @@ void loadConfig() {
   }
 
   // --- Automatic dimming ---
-  if (doc.containsKey("autoDimmingEnabled")) {
+  if (!doc["autoDimmingEnabled"].isNull()) {
     if (doc["autoDimmingEnabled"].is<bool>()) {
       autoDimmingEnabled = doc["autoDimmingEnabled"].as<bool>();
     } else {
@@ -604,7 +520,7 @@ void loadConfig() {
 
 
   // --- COUNTDOWN CONFIG LOADING ---
-  if (doc.containsKey("countdown")) {
+  if (doc["countdown"].is<JsonObject>()) {
     JsonObject countdownObj = doc["countdown"];
 
     countdownEnabled = countdownObj["enabled"] | false;
@@ -633,7 +549,7 @@ void loadConfig() {
   }
 
   // --- CLOCK-ONLY-DURING-DIMMING LOADING ---
-  if (doc.containsKey("clockOnlyDuringDimming")) {
+  if (!doc["clockOnlyDuringDimming"].isNull()) {
     clockOnlyDuringDimming = doc["clockOnlyDuringDimming"].as<bool>();
   } else {
     clockOnlyDuringDimming = false;
@@ -642,19 +558,6 @@ void loadConfig() {
     Serial.println(F("[CONFIG] Migrated: added clockOnlyDuringDimming default."));
   }
 
-  // --- DONATION MESSAGE LOADING / MIGRATION ---
-  if (doc.containsKey("hideDonationMsg")) {
-    hideDonationMsg = doc["hideDonationMsg"].as<bool>();
-    nextDonationTime = (time_t)(doc["nextDonationTime"] | 0);
-  } else {
-    // Existing customer upgrading — silence donation messages silently
-    hideDonationMsg = true;
-    nextDonationTime = 0;
-    doc["hideDonationMsg"] = true;
-    doc["nextDonationTime"] = 0;
-    configChanged = true;
-    Serial.println(F("[CONFIG] Migrated: existing user detected, hideDonationMsg set to true."));
-  }
 
   // --- Save migrated config if needed ---
   if (configChanged) {
@@ -671,7 +574,7 @@ void loadConfig() {
   }
 
   // --- BUTTON CONFIG LOADING ---
-  if (doc.containsKey("buttons")) {
+  if (doc["buttons"].is<JsonArray>()) {
     JsonArray arr = doc["buttons"].as<JsonArray>();
 
     for (int i = 0; i < 4 && i < (int)arr.size(); i++) {
@@ -1008,18 +911,6 @@ void printConfigToSerial() {
   Serial.println(isDramaticCountdown ? "Yes" : "No");
   Serial.print(F("Custom Message: "));
   Serial.println(customMessage);
-  Serial.print(F("Donation Messages: "));
-  Serial.println(hideDonationMsg ? "Hidden (user opted out)" : "Enabled");
-  Serial.print(F("Next Donation Message: "));
-  if (hideDonationMsg || nextDonationTime == 0) {
-    Serial.println(F("N/A"));
-  } else {
-    struct tm t;
-    localtime_r(&nextDonationTime, &t);
-    char buf[32];
-    strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M", &t);
-    Serial.println(buf);
-  }
   Serial.print(F("Total Runtime: "));
   if (getTotalRuntimeSeconds() > 0) {
     Serial.println(formatTotalRuntime());
@@ -1227,7 +1118,7 @@ void replaceIconTokens(String &msg, int &totalPixelWidth) {
 }
 
 void handleCustomMessageLogic(AsyncWebServerRequest *request) {
-  if (isNetworkBusy) {
+  if (networkData.busy()) {
     Serial.println(F("[MESSAGE] Rejected: Network Busy"));
     AsyncWebServerResponse *busyResponse = request->beginResponse(503, "text/plain", "Network Busy");
     busyResponse->addHeader("Access-Control-Allow-Origin", "*");
@@ -1425,7 +1316,7 @@ void setupWebServer() {
 
   // Root handler with BOTH CORS and Cache-Prevention
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
-    AsyncWebServerResponse *response = request->beginResponse_P(200, "text/html", index_html);
+    AsyncWebServerResponse *response = request->beginResponse(200, "text/html", index_html);
     // Anti-Caching Headers: Ensures the browser always fetches the latest UI
     response->addHeader("Cache-Control", "no-cache, no-store, must-revalidate");
     response->addHeader("Pragma", "no-cache");
@@ -1443,7 +1334,7 @@ void setupWebServer() {
       request->send(500, "application/json", "{\"error\":\"Failed to open config.json\"}");
       return;
     }
-    DynamicJsonDocument doc(2048);
+    JsonDocument doc;
     DeserializationError err = deserializeJson(doc, f);
     f.close();
     if (err) {
@@ -1466,7 +1357,7 @@ void setupWebServer() {
 
   server.on("/save", HTTP_POST, [](AsyncWebServerRequest *request) {
     Serial.println(F("[WEBSERVER] Request: /save"));
-    DynamicJsonDocument doc(2048);
+    JsonDocument doc;
 
     File configFile = LittleFS.open("/config.json", "r");
     if (configFile) {
@@ -1565,7 +1456,7 @@ void setupWebServer() {
       }
     }
 
-    JsonObject countdownObj = doc.createNestedObject("countdown");
+    JsonObject countdownObj = doc["countdown"].to<JsonObject>();
     countdownObj["enabled"] = newCountdownEnabled;
     countdownObj["targetTimestamp"] = newTargetTimestamp;
     countdownObj["label"] = countdownLabelStr;
@@ -1582,7 +1473,7 @@ void setupWebServer() {
     File f = LittleFS.open("/config.json", "w");
     if (!f) {
       Serial.println(F("[SAVE] ERROR: Failed to open /config.json for writing!"));
-      DynamicJsonDocument errorDoc(256);
+      JsonDocument errorDoc;
       errorDoc[F("error")] = "Failed to write config file.";
       String response;
       serializeJson(errorDoc, response);
@@ -1598,7 +1489,7 @@ void setupWebServer() {
     File verify = LittleFS.open("/config.json", "r");
     if (!verify) {
       Serial.println(F("[SAVE] ERROR: Failed to open /config.json for reading during verification!"));
-      DynamicJsonDocument errorDoc(256);
+      JsonDocument errorDoc;
       errorDoc[F("error")] = "Verification failed: Could not re-open config file.";
       String response;
       serializeJson(errorDoc, response);
@@ -1611,14 +1502,14 @@ void setupWebServer() {
     }
     verify.seek(0);
 
-    DynamicJsonDocument test(2048);
+    JsonDocument test;
     DeserializationError err = deserializeJson(test, verify);
     verify.close();
 
     if (err) {
       Serial.print(F("[SAVE] Config corrupted after save: "));
       Serial.println(err.f_str());
-      DynamicJsonDocument errorDoc(256);
+      JsonDocument errorDoc;
       errorDoc[F("error")] = String("Config corrupted. Reboot cancelled. Error: ") + err.f_str();
       String response;
       serializeJson(errorDoc, response);
@@ -1627,8 +1518,8 @@ void setupWebServer() {
     }
 
     Serial.println(F("[SAVE] Config verification successful."));
-    DynamicJsonDocument okDoc(128);
-    if (doc.containsKey("hostname")) {
+    JsonDocument okDoc;
+    if (doc["hostname"].is<const char *>()) {
       deviceHostname = doc["hostname"].as<String>();
     }
     strlcpy(customMessage, doc["customMessage"] | "", sizeof(customMessage));
@@ -1653,7 +1544,7 @@ void setupWebServer() {
       File src = LittleFS.open("/config.bak", "r");
       if (!src) {
         Serial.println(F("[WEBSERVER] Failed to open /config.bak"));
-        DynamicJsonDocument errorDoc(128);
+        JsonDocument errorDoc;
         errorDoc[F("error")] = "Failed to open backup file.";
         String response;
         serializeJson(errorDoc, response);
@@ -1664,7 +1555,7 @@ void setupWebServer() {
       if (!dst) {
         src.close();
         Serial.println(F("[WEBSERVER] Failed to open /config.json for writing"));
-        DynamicJsonDocument errorDoc(128);
+        JsonDocument errorDoc;
         errorDoc[F("error")] = "Failed to open config for writing.";
         String response;
         serializeJson(errorDoc, response);
@@ -1678,7 +1569,7 @@ void setupWebServer() {
       src.close();
       dst.close();
 
-      DynamicJsonDocument okDoc(128);
+      JsonDocument okDoc;
       okDoc[F("message")] = "✅ Backup restored! Device will now reboot.";
       String response;
       serializeJson(okDoc, response);
@@ -1692,7 +1583,7 @@ void setupWebServer() {
 
     } else {
       Serial.println(F("[WEBSERVER] No backup found"));
-      DynamicJsonDocument errorDoc(128);
+      JsonDocument errorDoc;
       errorDoc[F("error")] = "No backup found.";
       String response;
       serializeJson(errorDoc, response);
@@ -1748,29 +1639,17 @@ void setupWebServer() {
     handleCustomMessageLogic(request);
   });
 
-  server.on("/set_hide_donation", HTTP_POST, [](AsyncWebServerRequest *request) {
-    String value = "";
-    if (request->hasParam("value", true)) {
-      value = request->getParam("value", true)->value();
-    } else if (request->params() > 0) {
-      value = request->getParam(0)->value();
-    }
-    hideDonationMsg = (value == "1" || value == "true" || value == "on");
-    saveConfigRuntime();
-    Serial.printf("[DONATION] hideDonationMsg set to %s\n", hideDonationMsg ? "true" : "false");
-    request->send(200, "application/json", "{\"ok\":true}");
-  });
 
   // --- Physical Buttons: get config ---
   server.on("/get_buttons", HTTP_GET, [](AsyncWebServerRequest *request) {
-    DynamicJsonDocument doc(1024);
-    JsonArray used = doc.createNestedArray("usedPins");
+    JsonDocument doc;
+    JsonArray used = doc["usedPins"].to<JsonArray>();
     used.add(CLK_PIN);
     used.add(CS_PIN);
     used.add(DATA_PIN);
-    JsonArray btns = doc.createNestedArray("buttons");
+    JsonArray btns = doc["buttons"].to<JsonArray>();
     for (int i = 0; i < 4; i++) {
-      JsonObject b = btns.createNestedObject();
+      JsonObject b = btns.add<JsonObject>();
       b["pin"] = btnCfg[i].pin;
       b["shortAction"] = btnCfg[i].shortAct;
       b["longAction"] = btnCfg[i].longAct;
@@ -1811,7 +1690,7 @@ void setupWebServer() {
         if (newPins[i] >= 0 && newPins[i] == newPins[j]) newPins[j] = -1;
 
     // Load existing config.json and patch the buttons key
-    DynamicJsonDocument doc(2048);
+    JsonDocument doc;
     File configFile = LittleFS.open("/config.json", "r");
     if (configFile) {
       deserializeJson(doc, configFile);
@@ -1819,9 +1698,9 @@ void setupWebServer() {
     }
 
     doc.remove("buttons");
-    JsonArray arr = doc.createNestedArray("buttons");
+    JsonArray arr = doc["buttons"].to<JsonArray>();
     for (int i = 0; i < 4; i++) {
-      JsonObject b = arr.createNestedObject();
+      JsonObject b = arr.add<JsonObject>();
       b["pin"] = newPins[i];
       b["shortAction"] = newShort[i];
       b["longAction"] = newLong[i];
@@ -1984,7 +1863,7 @@ void setupWebServer() {
   });
 
   server.on("/status", HTTP_GET, [](AsyncWebServerRequest *request) {
-    DynamicJsonDocument doc(1536);
+    JsonDocument doc;
 
     // --- Identity ---
     doc["id"] = deviceHostname;
@@ -2043,7 +1922,7 @@ void setupWebServer() {
     doc["epochTime"] = static_cast<uint32_t>(nowTime);
 
     // --- Countdown ---
-    JsonObject cd = doc.createNestedObject("countdown");
+    JsonObject cd = doc["countdown"].to<JsonObject>();
     cd["enabled"] = countdownEnabled;
     cd["targetTimestamp"] = countdownTargetTimestamp;
     cd["label"] = String(countdownLabel);
@@ -2056,7 +1935,7 @@ void setupWebServer() {
     doc["countdownLabel"] = String(countdownLabel);
 
     // --- Weather ---
-    JsonObject weather = doc.createNestedObject("weather");
+    JsonObject weather = doc["weather"].to<JsonObject>();
 
     if (weatherAvailable && weatherDescription.length() > 0) {
       weather["currentTemperature"] = String(currentTemp).toInt();
@@ -2076,7 +1955,7 @@ void setupWebServer() {
 
     // --- Nightscout info ---
 #if defined(ESP32) || defined(ESP8266)
-    JsonObject ns = doc.createNestedObject("nightscout");
+    JsonObject ns = doc["nightscout"].to<JsonObject>();
     ns["active"] = (displayMode == 4);
     if (currentGlucose != -1) ns["glucose"] = currentGlucose;
     else ns["glucose"] = nullptr;
@@ -2097,7 +1976,7 @@ void setupWebServer() {
 #endif
 
     // --- SNS info (YouTube / Instagram) ---
-    JsonObject sns = doc.createNestedObject("sns");
+    JsonObject sns = doc["sns"].to<JsonObject>();
     switch (snsType) {
       case SNS_YOUTUBE: sns["type"] = "youtube"; break;
       case SNS_INSTAGRAM: sns["type"] = "instagram"; break;
@@ -2110,7 +1989,7 @@ void setupWebServer() {
     sns["rssTitle"] = (rssTitle.length() > 0) ? rssTitle : JsonVariant();
 
     // --- Saved Config ---
-    JsonObject config = doc.createNestedObject("config");
+    JsonObject config = doc["config"].to<JsonObject>();
     config["ssid"] = String(ssid);
     config["openWeatherApiKey"] = (strlen(openWeatherApiKey) > 0) ? "***HIDDEN***" : "";
     config["openWeatherCity"] = String(openWeatherCity);
@@ -2137,7 +2016,7 @@ void setupWebServer() {
     }
 
     // --- Dimming ---
-    JsonObject dimming = doc.createNestedObject("dimming");
+    JsonObject dimming = doc["dimming"].to<JsonObject>();
     dimming["dimmingEnabled"] = dimmingEnabled;
     dimming["dimStartHour"] = dimStartHour;
     dimming["dimStartMinute"] = dimStartMinute;
@@ -2146,29 +2025,18 @@ void setupWebServer() {
     dimming["autoDimmingEnabled"] = autoDimmingEnabled;
     dimming["clockOnlyDuringDimming"] = clockOnlyDuringDimming;
 
-    // --- Donations ---
-    doc["hideDonationMsg"] = hideDonationMsg;
-    if (!hideDonationMsg && nextDonationTime > 0) {
-      struct tm t;
-      localtime_r(&nextDonationTime, &t);
-      char buf[32];
-      strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M", &t);
-      doc["nextDonationTime"] = String(buf);
-    } else {
-      doc["nextDonationTime"] = "N/A";
-    }
 
     // --- Pins ---
-    JsonObject pins = doc.createNestedObject("pins");
+    JsonObject pins = doc["pins"].to<JsonObject>();
     pins["clk"] = CLK_PIN;
     pins["cs"] = CS_PIN;
     pins["data"] = DATA_PIN;
 
     // --- buttons ---
-    JsonArray buttons = doc.createNestedArray("buttons");
+    JsonArray buttons = doc["buttons"].to<JsonArray>();
 
     for (int i = 0; i < 4; i++) {
-      JsonObject b = buttons.createNestedObject();
+      JsonObject b = buttons.add<JsonObject>();
       b["pin"] = btnCfg[i].pin;
       b["shortAction"] = btnCfg[i].shortAct;
       b["longAction"] = btnCfg[i].longAct;
@@ -2197,7 +2065,7 @@ void setupWebServer() {
       return;
     }
 
-    DynamicJsonDocument doc(2048);
+    JsonDocument doc;
     DeserializationError err = deserializeJson(doc, f);
     f.close();
     if (err) {
@@ -2373,7 +2241,7 @@ void setupWebServer() {
   });
 
   server.on("/perform_update", HTTP_GET, [](AsyncWebServerRequest *request) {
-    isUpdating = true;
+    otaState.updating = true;
 
     // Immediate UI Feedback
     P.displayClear();
@@ -2389,8 +2257,8 @@ void setupWebServer() {
       if (!Update.hasError()) {
         request->send(200, "text/plain", "OK");
         // Set flags to reboot in the main loop
-        pendingRestart = true;
-        restartTimer = millis();
+        otaState.restartPending = true;
+        otaState.restartRequestedAt = millis();
       } else {
         request->send(200, "text/plain", "FAIL");
       }
@@ -2716,559 +2584,14 @@ String cleanTextForDisplay(String str) {
 }
 
 
-bool isNumber(const char *str) {
-  for (int i = 0; str[i]; i++) {
-    if (!isdigit(str[i]) && str[i] != '.' && str[i] != '-') return false;
-  }
-  return true;
-}
 
-bool isFiveDigitZip(const char *str) {
-  if (strlen(str) != 5) return false;
-  for (int i = 0; i < 5; i++) {
-    if (!isdigit(str[i])) return false;
-  }
-  return true;
-}
 
 
-// -----------------------------------------------------------------------------
-// Weather Fetching and API settings
-// -----------------------------------------------------------------------------
-String buildWeatherURL() {
-#if defined(ESP8266) || defined(CONFIG_IDF_TARGET_ESP32S2)
-  String base = "http://api.openweathermap.org/data/2.5/weather?";
-#else
-  String base = "https://api.openweathermap.org/data/2.5/weather?";
-#endif
 
-  float lat = atof(openWeatherCity);
-  float lon = atof(openWeatherCountry);
 
-  bool latValid = isNumber(openWeatherCity) && isNumber(openWeatherCountry) && lat >= -90.0 && lat <= 90.0 && lon >= -180.0 && lon <= 180.0;
 
-  // Create encoded copies
-  String cityEncoded = String(openWeatherCity);
-  String countryEncoded = String(openWeatherCountry);
-  cityEncoded.replace(" ", "%20");
-  countryEncoded.replace(" ", "%20");
 
-  if (latValid) {
-    base += "lat=" + String(lat, 8) + "&lon=" + String(lon, 8);
-  } else if (isFiveDigitZip(openWeatherCity) && String(openWeatherCountry).equalsIgnoreCase("US")) {
-    base += "zip=" + String(openWeatherCity) + "," + String(openWeatherCountry);
-  } else {
-    base += "q=" + cityEncoded + "," + countryEncoded;
-  }
 
-  base += "&appid=" + String(openWeatherApiKey);
-  base += "&units=" + String(weatherUnits);
-
-  String langForAPI = String(language);
-  if (langForAPI == "eo" || langForAPI == "ga" || langForAPI == "sw" || langForAPI == "ja") {
-    langForAPI = "en";
-  }
-  base += "&lang=" + langForAPI;
-
-  return base;
-}
-
-
-void fetchWeather() {
-  if (millis() - lastWifiConnectTime < 5000) {
-    Serial.println(F("[WEATHER] Skipped: Network just reconnected. Letting it stabilize..."));
-    return;  // Stop execution if connection is less than 5 seconds old
-  }
-
-  Serial.println(F("[WEATHER] Fetching weather data..."));
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println(F("[WEATHER] Skipped: WiFi not connected"));
-    weatherAvailable = false;
-    weatherFetched = false;
-    return;
-  }
-  if (!openWeatherApiKey || strlen(openWeatherApiKey) != 32) {
-    Serial.println(F("[WEATHER] Skipped: Invalid API key (must be exactly 32 characters)"));
-    weatherAvailable = false;
-    weatherFetched = false;
-    return;
-  }
-  if (!(strlen(openWeatherCity) > 0 && strlen(openWeatherCountry) > 0)) {
-    Serial.println(F("[WEATHER] Skipped: City or Country is empty."));
-    weatherAvailable = false;
-    return;
-  }
-
-  Serial.println(F("[WEATHER] Connecting to OpenWeatherMap..."));
-  String url = buildWeatherURL();
-  Serial.print(F("[WEATHER] URL: "));  // Use F() with Serial.print
-  Serial.println(url);
-
-  HTTPClient http;  // Create an HTTPClient object
-
-#if defined(ESP8266) || defined(CONFIG_IDF_TARGET_ESP32S2)
-  // ===== ESP8266 → HTTP =====
-  WiFiClient client;
-  client.stop();
-  yield();
-
-  http.begin(client, url);
-#else
-  // ===== ESP32 → HTTPS =====
-  WiFiClientSecure client;
-  client.stop();
-  yield();
-  client.setInsecure();  // no cert validation
-
-  http.begin(client, url);
-#endif
-
-  http.setTimeout(10000);  // Sets both connection and stream timeout to 10 seconds
-
-  Serial.println(F("[WEATHER] Sending GET request..."));
-  int httpCode = http.GET();  // Send the GET request
-
-  if (httpCode == HTTP_CODE_OK) {  // Check if HTTP response code is 200 (OK)
-    Serial.println(F("[WEATHER] HTTP 200 OK. Reading payload..."));
-
-    String payload = http.getString();
-    Serial.println(F("[WEATHER] Response received."));
-    Serial.print(F("[WEATHER] Payload: "));  // Use F() with Serial.print
-    Serial.println(payload);
-
-    DynamicJsonDocument doc(1536);  // Adjust size as needed, use ArduinoJson Assistant
-    DeserializationError error = deserializeJson(doc, payload);
-
-    if (error) {
-      Serial.print(F("[WEATHER] JSON parse error: "));
-      Serial.println(error.f_str());
-      weatherAvailable = false;
-      return;
-    }
-
-    if (doc.containsKey(F("main")) && doc[F("main")].containsKey(F("temp"))) {
-      float temp = doc[F("main")][F("temp")];
-      currentTemp = String((int)round(temp)) + char(176);
-      Serial.printf("[WEATHER] Temp: %d°\n", (int)round(temp));
-      weatherAvailable = true;
-    } else {
-      Serial.println(F("[WEATHER] Temperature not found in JSON payload"));
-      weatherAvailable = false;
-      return;
-    }
-
-    if (doc.containsKey(F("main")) && doc[F("main")].containsKey(F("humidity"))) {
-      currentHumidity = doc[F("main")][F("humidity")];
-      Serial.printf("[WEATHER] Humidity: %d%%\n", currentHumidity);
-    } else {
-      currentHumidity = -1;
-    }
-
-    if (doc.containsKey(F("weather")) && doc[F("weather")].is<JsonArray>()) {
-      JsonObject weatherObj = doc[F("weather")][0];
-      if (weatherObj.containsKey(F("main"))) {
-        mainDesc = weatherObj[F("main")].as<String>();
-      }
-      if (weatherObj.containsKey(F("description"))) {
-        detailedDesc = weatherObj[F("description")].as<String>();
-      }
-      if (weatherObj.containsKey(F("icon"))) {
-        weatherIcon = getWeatherIconChar(weatherObj[F("icon")].as<String>());
-      }
-    } else {
-      Serial.println(F("[WEATHER] Weather description not found in JSON payload"));
-    }
-    weatherDescription = String(weatherIcon) + " " + cleanTextForDisplay(detailedDesc);
-    Serial.printf("[WEATHER] Description used: %s\n", weatherDescription.c_str());
-
-    // -----------------------------------------
-    // Sunrise/Sunset for Auto Dimming (local time)
-    // -----------------------------------------
-    if (doc.containsKey(F("sys"))) {
-      JsonObject sys = doc[F("sys")];
-      if (sys.containsKey(F("sunrise")) && sys.containsKey(F("sunset"))) {
-        // OWM gives UTC timestamps
-        time_t sunriseUtc = sys[F("sunrise")].as<time_t>();
-        time_t sunsetUtc = sys[F("sunset")].as<time_t>();
-
-        // Get local timezone offset (in seconds)
-        long tzOffset = 0;
-        struct tm local_tm;
-        time_t now = time(nullptr);
-        if (localtime_r(&now, &local_tm)) {
-          tzOffset = mktime(&local_tm) - now;
-        }
-
-        // Convert UTC → local
-        time_t sunriseLocal = sunriseUtc + tzOffset;
-        time_t sunsetLocal = sunsetUtc + tzOffset;
-
-        // Break into hour/minute
-        struct tm tmSunrise, tmSunset;
-        localtime_r(&sunriseLocal, &tmSunrise);
-        localtime_r(&sunsetLocal, &tmSunset);
-
-        sunriseHour = tmSunrise.tm_hour;
-        sunriseMinute = tmSunrise.tm_min;
-        sunsetHour = tmSunset.tm_hour;
-        sunsetMinute = tmSunset.tm_min;
-
-        Serial.printf("[WEATHER] Adjusted Sunrise/Sunset (local): %02d:%02d | %02d:%02d\n",
-                      sunriseHour, sunriseMinute, sunsetHour, sunsetMinute);
-      } else {
-        Serial.println(F("[WEATHER] Sunrise/Sunset not found in JSON."));
-      }
-    } else {
-      Serial.println(F("[WEATHER] 'sys' object not found in JSON payload."));
-    }
-
-    weatherFetched = true;
-
-    // -----------------------------------------
-    // Save updated sunrise/sunset to config.json
-    // -----------------------------------------
-    if (autoDimmingEnabled && sunriseHour >= 0 && sunsetHour >= 0) {
-      File configFile = LittleFS.open("/config.json", "r");
-      DynamicJsonDocument doc(1024);
-
-      if (configFile) {
-        DeserializationError error = deserializeJson(doc, configFile);
-        configFile.close();
-
-        if (!error) {
-          // Check if ANY value has changed
-          bool valuesChanged =
-            (doc["sunriseHour"].as<int>() != sunriseHour || doc["sunriseMinute"].as<int>() != sunriseMinute || doc["sunsetHour"].as<int>() != sunsetHour || doc["sunsetMinute"].as<int>() != sunsetMinute);
-
-          if (valuesChanged) {  // Only write if a change occurred
-            doc["sunriseHour"] = sunriseHour;
-            doc["sunriseMinute"] = sunriseMinute;
-            doc["sunsetHour"] = sunsetHour;
-            doc["sunsetMinute"] = sunsetMinute;
-
-            File f = LittleFS.open("/config.json", "w");
-            if (f) {
-              serializeJsonPretty(doc, f);
-              f.close();
-              Serial.println(F("[WEATHER] SAVED NEW sunrise/sunset to config.json (Values changed)"));
-            } else {
-              Serial.println(F("[WEATHER] Failed to write updated sunrise/sunset to config.json"));
-            }
-          } else {
-            Serial.println(F("[WEATHER] Sunrise/Sunset unchanged, skipping config save."));
-          }
-          // --- END MODIFIED COMPARISON LOGIC ---
-
-        } else {
-          Serial.println(F("[WEATHER] JSON parse error when saving updated sunrise/sunset"));
-        }
-      }
-    }
-
-  } else {
-    Serial.printf("[WEATHER] HTTP GET failed, error code: %d, reason: %s\n",
-                  httpCode, http.errorToString(httpCode).c_str());
-    weatherAvailable = false;
-    weatherFetched = false;
-  }
-
-  http.end();
-}
-
-
-void fetchNightscout() {
-  if (WiFi.status() != WL_CONNECTED) return;
-  if (ESP.getFreeHeap() < 10000 || isNetworkBusy) return;
-
-#ifdef ESP8266
-  // --- URL encode helper ---
-  auto urlEncode = [](String str) -> String {
-    String encoded = "";
-    for (int i = 0; i < str.length(); i++) {
-      char c = str.charAt(i);
-      if (isalnum(c)) {
-        encoded += c;
-      } else {
-        char code1 = (c & 0xf) + '0';
-        if ((c & 0xf) > 9) code1 = (c & 0xf) - 10 + 'A';
-        char c2 = (c >> 4) & 0xf;
-        char code0 = c2 + '0';
-        if (c2 > 9) code0 = c2 - 10 + 'A';
-        encoded += '%';
-        encoded += code0;
-        encoded += code1;
-      }
-    }
-    return encoded;
-  };
-
-  // --- Detect and strip mmol=1 and show_every=N ---
-  String rawUrl = String(ntpServer2);
-  nightscoutMmol = (rawUrl.indexOf("mmol=1") != -1);
-  if (nightscoutMmol) rawUrl = stripUrlParam(rawUrl, "mmol");
-  rawUrl = stripUrlParam(rawUrl, "show_every");
-
-  String bridgeUrl = "http://esptimecast.com/nightscout-bridge.php?url=";
-  bridgeUrl += urlEncode(rawUrl);
-
-  isNetworkBusy = true;
-  Serial.println("[NIGHTSCOUT] Fetching via PHP bridge");
-
-  WiFiClient client;
-  HTTPClient http;
-  http.addHeader("User-Agent", "Mozilla/5.0");
-  if (http.begin(client, bridgeUrl)) {
-    http.setTimeout(4000);
-    int httpCode = http.GET();
-    if (httpCode == 200) {
-      String payload = http.getString();
-      payload.trim();
-      Serial.printf("[NIGHTSCOUT] Payload: %s\n", payload.c_str());
-
-      int space1 = payload.indexOf(' ');
-      int space2 = payload.lastIndexOf(' ');
-      if (space1 != -1 && space2 != -1 && space1 != space2) {
-        int parsedGlucose = payload.substring(0, space1).toInt();
-        if (parsedGlucose > 0) {
-          currentGlucose = parsedGlucose;
-          currentDirection = payload.substring(space1 + 1, space2);
-          long long date = (long long)payload.substring(space2 + 1).toFloat();
-          if (date > 0) lastGlucoseTime = date;  // already in seconds from PHP
-          Serial.printf("[NIGHTSCOUT] Fetched: %d (%s) %s\n",
-                        currentGlucose,
-                        nightscoutMmol ? "will display as mmol" : "mg/dL",
-                        currentDirection.c_str());
-          lastNightscoutFetchTime = millis();
-          nightscoutFailCount = 0;
-        } else {
-          Serial.println("[NIGHTSCOUT] Bridge returned error response, will retry");
-          lastNightscoutFetchTime = millis() - NIGHTSCOUT_FETCH_INTERVAL + 60000;
-        }
-      } else {
-        Serial.println("[NIGHTSCOUT] Failed to parse payload");
-        lastNightscoutFetchTime = millis() - NIGHTSCOUT_FETCH_INTERVAL + 60000;
-      }
-    } else if (httpCode == 404) {
-      Serial.println(F("[NIGHTSCOUT] Bridge: invalid URL (404). Pausing fetch for 24h."));
-      nightscoutBackoffUntil = millis() + 86400000UL;
-    } else if (httpCode == 429) {
-      Serial.println(F("[NIGHTSCOUT] Bridge: rate limited (429). Backing off 30 min."));
-      nightscoutBackoffUntil = millis() + 1800000UL;
-    } else {
-      nightscoutFailCount++;
-      Serial.printf("[NIGHTSCOUT] HTTP failed (%d): %s\n", nightscoutFailCount, http.errorToString(httpCode).c_str());
-      if (nightscoutFailCount >= 3) {
-        unsigned long backoff = (nightscoutFailCount >= 6) ? 1800000UL : 300000UL;
-        Serial.printf("[NIGHTSCOUT] %d consecutive failures, backing off %lu min.\n",
-                      nightscoutFailCount, backoff / 60000UL);
-        nightscoutBackoffUntil = millis() + backoff;
-      }
-    }
-    http.end();
-  }
-
-#else
-  // --- ESP32: direct HTTPS + JSON ---
-  String rawUrl = String(ntpServer2);
-  nightscoutMmol = (rawUrl.indexOf("mmol=1") != -1);
-  if (nightscoutMmol) rawUrl = stripUrlParam(rawUrl, "mmol");
-  rawUrl = stripUrlParam(rawUrl, "show_every");
-
-  if (rawUrl.indexOf("count=") == -1)
-    rawUrl += (rawUrl.indexOf('?') == -1) ? "?count=1" : "&count=1";
-
-  isNetworkBusy = true;
-  Serial.printf("[NIGHTSCOUT] Fetching%s direct\n", nightscoutMmol ? " (mmol)" : " (mg/dL)");
-
-  WiFiClientSecure client;
-  client.setInsecure();
-  HTTPClient https;
-  https.begin(client, rawUrl);
-  https.setTimeout(8000);
-  int httpCode = https.GET();
-  if (httpCode == HTTP_CODE_OK) {
-    WiFiClient *stream = https.getStreamPtr();
-    StaticJsonDocument<1024> doc;
-    DeserializationError error = deserializeJson(doc, *stream);
-    if (!error && doc.is<JsonArray>() && doc.size() > 0) {
-      JsonObject firstReading = doc[0].as<JsonObject>();
-      currentGlucose = firstReading["sgv"] | firstReading["glucose"] | -1;
-      currentDirection = firstReading["direction"] | "?";
-      long long dateMs = firstReading["date"] | 0LL;
-      if (dateMs > 0) lastGlucoseTime = dateMs / 1000;  // JSON returns ms, convert to seconds
-      Serial.printf("[NIGHTSCOUT] Fetched: %d (%s) %s\n",
-                    currentGlucose,
-                    nightscoutMmol ? "will display as mmol" : "mg/dL",
-                    currentDirection.c_str());
-      lastNightscoutFetchTime = millis();
-      nightscoutFailCount = 0;
-    } else {
-      Serial.println("[NIGHTSCOUT] Failed to parse JSON");
-      lastNightscoutFetchTime = millis() - NIGHTSCOUT_FETCH_INTERVAL + 60000;
-    }
-  } else if (httpCode == 404) {
-    Serial.println(F("[NIGHTSCOUT] Bridge: invalid URL (404). Pausing fetch for 24h."));
-    nightscoutBackoffUntil = millis() + 86400000UL;
-    nightscoutFailCount = 0;
-  } else if (httpCode == 429) {
-    Serial.println(F("[NIGHTSCOUT] Bridge: rate limited (429). Backing off 30 min."));
-    nightscoutBackoffUntil = millis() + 1800000UL;
-    nightscoutFailCount = 0;
-  } else {
-    nightscoutFailCount++;
-    Serial.printf("[NIGHTSCOUT] HTTPS failed (%d): %s\n", nightscoutFailCount, https.errorToString(httpCode).c_str());
-    if (nightscoutFailCount >= 3) {
-      unsigned long backoff = (nightscoutFailCount >= 6) ? 1800000UL : 300000UL;
-      Serial.printf("[NIGHTSCOUT] %d consecutive failures, backing off %lu min.\n",
-                    nightscoutFailCount, backoff / 60000UL);
-      nightscoutBackoffUntil = millis() + backoff;
-    }
-  }
-  https.end();
-  client.stop();
-#endif
-
-  delay(100);
-  isNetworkBusy = false;
-}
-
-
-// -----------------------------
-// Load uptime from LittleFS
-// -----------------------------
-void loadUptime() {
-  if (LittleFS.exists("/uptime.dat")) {
-    File f = LittleFS.open("/uptime.dat", "r");
-    if (f) {
-      totalUptimeSeconds = f.parseInt();
-      f.close();
-      bootMillis = millis();
-      Serial.printf("[UPTIME] Loaded accumulated uptime: %lu seconds (%.2f hours)\n",
-                    totalUptimeSeconds, totalUptimeSeconds / 3600.0);
-    } else {
-      Serial.println(F("[UPTIME] Failed to open /uptime.dat for reading."));
-      totalUptimeSeconds = 0;
-      bootMillis = millis();
-    }
-  } else {
-    Serial.println(F("[UPTIME] No previous uptime file found. Starting from 0."));
-    totalUptimeSeconds = 0;
-    bootMillis = millis();
-  }
-}
-
-
-// -----------------------------
-// Save uptime to LittleFS
-// -----------------------------
-void saveUptime() {
-  // Use getTotalRuntimeSeconds() to include current session
-  totalUptimeSeconds = getTotalRuntimeSeconds();
-  bootMillis = millis();  // reset session start
-
-  File f = LittleFS.open("/uptime.dat", "w");
-  if (f) {
-    f.print(totalUptimeSeconds);
-    f.close();
-    Serial.printf("[UPTIME] Saved accumulated uptime: %s\n", formatTotalRuntime().c_str());
-  } else {
-    Serial.println(F("[UPTIME] Failed to write /uptime.dat"));
-  }
-}
-
-
-// -----------------------------
-// Get total uptime including current session
-// -----------------------------
-unsigned long getTotalRuntimeSeconds() {
-  return totalUptimeSeconds + (millis() - bootMillis) / 1000;
-}
-
-
-// -----------------------------
-// Format total uptime as HH:MM:SS
-// -----------------------------
-String formatTotalRuntime() {
-  unsigned long secs = getTotalRuntimeSeconds();
-  unsigned int h = secs / 3600;
-  unsigned int m = (secs % 3600) / 60;
-  unsigned int s = secs % 60;
-  char buf[16];
-  sprintf(buf, "%02u:%02u:%02u", h, m, s);
-  return String(buf);
-}
-
-
-void saveCustomMessageToConfig(const char *msg) {
-  Serial.println(F("[CONFIG] Updating customMessage in config.json..."));
-
-  DynamicJsonDocument doc(2048);
-
-  // Load existing config.json (if present)
-  File configFile = LittleFS.open("/config.json", "r");
-  if (configFile) {
-    DeserializationError err = deserializeJson(doc, configFile);
-    configFile.close();
-    if (err) {
-      Serial.print(F("[CONFIG] Error reading existing config: "));
-      Serial.println(err.f_str());
-    }
-  }
-
-  // Update only customMessage
-  doc["customMessage"] = msg;
-
-  // Safely write back to config.json
-  if (LittleFS.exists("/config.json")) {
-    LittleFS.rename("/config.json", "/config.bak");
-  }
-
-  File f = LittleFS.open("/config.json", "w");
-  if (!f) {
-    Serial.println(F("[CONFIG] ERROR: Failed to open /config.json for writing"));
-    return;
-  }
-
-  size_t bytesWritten = serializeJson(doc, f);
-  f.close();
-  Serial.printf("[CONFIG] Saved customMessage='%s' (%u bytes written)\n", msg, bytesWritten);
-}
-
-// Returns formatted uptime (for web UI or logs)
-String formatUptime(unsigned long seconds) {
-  unsigned long days = seconds / 86400;
-  unsigned long hours = (seconds % 86400) / 3600;
-  unsigned long minutes = (seconds % 3600) / 60;
-  unsigned long secs = seconds % 60;
-
-  char buf[64];
-  if (days > 0)
-    sprintf(buf, "%lud %02lu:%02lu:%02lu", days, hours, minutes, secs);
-  else
-    sprintf(buf, "%02lu:%02lu:%02lu", hours, minutes, secs);
-  return String(buf);
-}
-
-// Weather Icon Mapping
-char getWeatherIconChar(const String &iconCode) {
-
-  if (iconCode.startsWith("01")) {                    // clear sky
-    return iconCode.endsWith("n") ? '\xA8' : '\x0C';  // Moon : Sun
-  }
-
-  if (iconCode.startsWith("02")) return '\x0D';  // few clouds
-  if (iconCode.startsWith("03")) return '\x0D';  // scattered clouds
-  if (iconCode.startsWith("04")) return '\x0D';  // broken clouds
-
-  if (iconCode.startsWith("09")) return '\x10';  // shower rain
-  if (iconCode.startsWith("10")) return '\x10';  // rain
-
-  if (iconCode.startsWith("11")) return '\x11';  // thunderstorm
-  if (iconCode.startsWith("13")) return '\x12';  // snow
-  if (iconCode.startsWith("50")) return '\xB9';  // mist
-
-  return '\x0D';  // fallback = cloud
-}
 
 // -----------------------------------------------------------------------------
 // Pomodoro Command Handler
@@ -3688,13 +3011,13 @@ void executeAction(const String &action, const String &value) {
       strcpy(weatherUnits, "metric");
       tempSymbol = '\006';
     }
-    shouldFetchWeatherNow = true;
+    networkData.requestWeatherRefresh();
     if (!hasValue) { goToMode("1"); }  // show the change on weather
 
   } else if (action == "metric") {
     strcpy(weatherUnits, "metric");
     tempSymbol = '\006';
-    shouldFetchWeatherNow = true;
+    networkData.requestWeatherRefresh();
     if (!hasValue) { goToMode("1"); }  // show the change on weather
 
   } else if (action == "countdown_enabled" || action == "countdown") {
@@ -3763,8 +3086,8 @@ void executeAction(const String &action, const String &value) {
     handleTimerCommand("[TIMER RESUME]");
 
   } else if (action == "restart") {
-    pendingRestart = true;
-    restartTimer = millis();
+    otaState.restartPending = true;
+    otaState.restartRequestedAt = millis();
 
   } else if (action == "save") {
     configDirty = true;
@@ -3774,7 +3097,7 @@ void executeAction(const String &action, const String &value) {
     lang.trim();
     lang.toLowerCase();
     strlcpy(language, lang.c_str(), sizeof(language));
-    shouldFetchWeatherNow = true;
+    networkData.requestWeatherRefresh();
     advanceDisplayMode();
 
   } else if (action == "clear_message") {
@@ -3912,42 +3235,6 @@ void goToMode(const String &target) {
   lastSwitch = millis();
 }
 
-void loadPins() {
-  prefs.begin("pins", false);
-
-  bool hasCLK = prefs.isKey("clk");
-  bool hasCS = prefs.isKey("cs");
-  bool hasDATA = prefs.isKey("data");
-
-  bool hasAll = hasCLK && hasCS && hasDATA;
-
-  // Migration (SAFE: only write missing keys)
-  if (!hasAll) {
-    Serial.println("[PIN CONFIG] Missing NVS keys - MIGRATION TRIGGERED");
-
-    if (!hasCLK) prefs.putInt("clk", L_CLK);
-    if (!hasCS) prefs.putInt("cs", L_CS);
-    if (!hasDATA) prefs.putInt("data", L_DATA);
-
-    Serial.println("[PIN CONFIG] Migration complete (non-destructive)");
-  }
-
-  // Load
-  CLK_PIN = prefs.getInt("clk", L_CLK);
-  CS_PIN = prefs.getInt("cs", L_CS);
-  DATA_PIN = prefs.getInt("data", L_DATA);
-
-  // Validation + fallback (optional improvement below)
-  if (CLK_PIN < 0 || CS_PIN < 0 || DATA_PIN < 0) {
-    Serial.println("[PIN CONFIG] Invalid pins - fallback to defaults");
-
-    CLK_PIN = L_CLK;
-    CS_PIN = L_CS;
-    DATA_PIN = L_DATA;
-  }
-
-  Serial.printf("[PIN CONFIG] Loaded pins - CLK:%d CS:%d DATA:%d\n", CLK_PIN, CS_PIN, DATA_PIN);
-}
 
 void setupButtons() {
   for (int i = 0; i < 4; i++) {
@@ -4031,12 +3318,28 @@ void setup() {
   }
   Serial.println(F("[FS] LittleFS mounted and ready."));
   loadUptime();
-  loadPins();
+  const PinConfig pins = loadPinConfig({ L_CLK, L_CS, L_DATA });
+  CLK_PIN = pins.clock;
+  CS_PIN = pins.chipSelect;
+  DATA_PIN = pins.data;
   new (&P) MD_Parola(HARDWARE_TYPE, DATA_PIN, CLK_PIN, CS_PIN, MAX_DEVICES);
   P.begin();
   P.setCharSpacing(0);
   P.setFont(mFactory);
   loadConfig();
+  WeatherData initialWeather;
+  initialWeather.available = weatherAvailable;
+  initialWeather.fetched = weatherFetched;
+  initialWeather.temperature = currentTemp;
+  initialWeather.mainDescription = mainDesc;
+  initialWeather.detailedDescription = detailedDesc;
+  initialWeather.icon = weatherIcon;
+  initialWeather.humidity = currentHumidity;
+  initialWeather.sunriseHour = sunriseHour;
+  initialWeather.sunriseMinute = sunriseMinute;
+  initialWeather.sunsetHour = sunsetHour;
+  initialWeather.sunsetMinute = sunsetMinute;
+  networkData.initialize(initialWeather);
   setupButtons();
   P.setIntensity(brightness);
   if (displayOff) {
@@ -4116,7 +3419,7 @@ void setup() {
   displayMode = 0;
   lastSwitch = millis() - (clockDuration - 500);
   lastColonBlink = millis();
-  bootMillis = millis();
+  resetUptimeSession();
   saveUptime();
 }
 
@@ -4290,7 +3593,7 @@ bool isModeAvailable(int mode) {
 
 //config save after countdown finishes
 bool saveCountdownConfig(bool enabled, time_t targetTimestamp, const String &label) {
-  DynamicJsonDocument doc(2048);
+  JsonDocument doc;
 
   File configFile = LittleFS.open("/config.json", "r");
   if (configFile) {
@@ -4303,7 +3606,7 @@ bool saveCountdownConfig(bool enabled, time_t targetTimestamp, const String &lab
     }
   }
 
-  JsonObject countdownObj = doc["countdown"].is<JsonObject>() ? doc["countdown"].as<JsonObject>() : doc.createNestedObject("countdown");
+  JsonObject countdownObj = doc["countdown"].to<JsonObject>();
   countdownObj["enabled"] = enabled;
   countdownObj["targetTimestamp"] = targetTimestamp;
   countdownObj["label"] = label;
@@ -4332,7 +3635,7 @@ bool saveCountdownConfig(bool enabled, time_t targetTimestamp, const String &lab
 
 bool saveConfigRuntime() {
 
-  DynamicJsonDocument doc(4096);
+  JsonDocument doc;
 
   File configFile = LittleFS.open("/config.json", "r");
   if (!configFile) {
@@ -4360,8 +3663,6 @@ bool saveConfigRuntime() {
   doc["showHumidity"] = showHumidity;
   doc["colonBlinkEnabled"] = colonBlinkEnabled;
   doc["clockOnlyDuringDimming"] = clockOnlyDuringDimming;
-  doc["hideDonationMsg"] = hideDonationMsg;
-  doc["nextDonationTime"] = (uint32_t)nextDonationTime;
 
   File configFileWrite = LittleFS.open("/config.json", "w");
   if (!configFileWrite) {
@@ -4416,77 +3717,6 @@ String getFormattedDateText(const char *rawText) {
   return output;
 }
 
-// -----------------------------------------------------------------------------
-// Donation / Encouragement Message Scheduler
-// -----------------------------------------------------------------------------
-const char *const DONATION_MESSAGES[3] = {
-  "SUPPORTING ESPTIMECAST KEEPS THE PROJECT ALIVE",
-  "SUPPORTING ESPTIMECAST MAKES FUTURE UPDATES POSSIBLE",
-  "SUPPORTING ESPTIMECAST HELPS KEEP IT GROWING"
-};
-
-time_t calcNextDonationTime(bool forceTomorrow) {
-  time_t now = time(nullptr);
-  struct tm local_tm;
-  localtime_r(&now, &local_tm);
-
-  struct tm midnight = local_tm;
-  midnight.tm_hour = 0;
-  midnight.tm_min = 0;
-  midnight.tm_sec = 0;
-  midnight.tm_isdst = -1;
-  time_t todayMidnight = mktime(&midnight);
-
-  const int windowStart = 10 * 60;  // 10:00
-  const int windowEnd = 21 * 60;    // 21:00
-  int curMinOfDay = local_tm.tm_hour * 60 + local_tm.tm_min;
-
-  if (!forceTomorrow && curMinOfDay < windowEnd) {
-    int rangeStart = max(curMinOfDay + 1, windowStart);
-    if (rangeStart < windowEnd) {
-      int chosen = random(rangeStart, windowEnd);
-      Serial.printf("[DONATION] Scheduled today at %02d:%02d\n", chosen / 60, chosen % 60);
-      return todayMidnight + ((time_t)chosen * 60L);
-    }
-  }
-
-  time_t tomorrowMidnight = todayMidnight + 86400L;
-  int chosen = random(windowStart, windowEnd);
-  Serial.printf("[DONATION] Scheduled tomorrow at %02d:%02d\n", chosen / 60, chosen % 60);
-  return tomorrowMidnight + ((time_t)chosen * 60L);
-}
-
-void triggerDonationMessage() {
-  if (hideDonationMsg) return;
-  if (isAPMode) return;
-  if (!ntpSyncSuccessful) return;
-  if (isNetworkBusy) return;
-  if (timerActive) return;
-  if (clockOnlyDuringDimming && dimActive) return;
-  if (!allowInterrupt) return;
-
-  int idx = random(0, 3);
-  String msg = String(DONATION_MESSAGES[idx]);
-  msg.toCharArray(customMessage, sizeof(customMessage));
-
-  messageScrollSpeed = 60;
-  messageScrollTimes = 1;
-  messageDisplaySeconds = 0;
-  messageBigNumbers = false;
-  allowInterrupt = true;
-  displayMode = 6;
-  prevDisplayMode = 0;
-  messageStartTime = millis();
-  currentScrollCount = 0;
-  currentDisplayCycleCount = 0;
-  clockScrollDone = false;
-  forceMessageRestart = true;
-
-  Serial.printf("[DONATION] Showing message %d: %s\n", idx, DONATION_MESSAGES[idx]);
-
-  nextDonationTime = calcNextDonationTime(true);  // always tomorrow after firing
-  saveConfigRuntime();
-}
 
 void loop() {
   handleButtons();
@@ -4538,12 +3768,12 @@ void loop() {
     }
   }
   // 1. REBOOT HANDLER: Execute the restart outside of the Async callback
-  if (pendingRestart && (millis() - restartTimer > 2000)) {
+  if (otaState.restartPending && (millis() - otaState.restartRequestedAt > 2000)) {
     Serial.println(F("[SYSTEM] Rebooting now..."));
     ESP.restart();
   }
   // 2. OTA LOCK: If updating, yield to WiFi and stop everything else
-  if (isUpdating) {
+  if (otaState.updating) {
     yield();
     return;
   }
@@ -4604,8 +3834,6 @@ void loop() {
   static int ntpAnimFrame = 0;
   static bool tzSetAfterSync = false;
 
-  static unsigned long lastFetch = 0;
-  const unsigned long fetchInterval = 300000;  // 5 minutes
 
 
   // -----------------------------
@@ -4767,12 +3995,6 @@ void loop() {
         setenv("TZ", posixTz, 1);
         tzset();
         tzSetAfterSync = true;
-        // Schedule donation time now that we know the real local time
-        if (!hideDonationMsg && nextDonationTime == 0) {
-          nextDonationTime = calcNextDonationTime(donationFirstBoot);
-          saveConfigRuntime();
-          Serial.println(F("[DONATION] NTP synced. First donation time scheduled."));
-        }
       }
       ntpAnimTimer = 0;
       ntpAnimFrame = 0;
@@ -4810,242 +4032,60 @@ void loop() {
     advanceDisplayMode();
   }
 
-  // --- DONATION MESSAGE CHECK ---
-  if (!hideDonationMsg && ntpSyncSuccessful && !isAPMode && nextDonationTime > 0) {
-    time_t now_d = time(nullptr);
-    if (now_d >= nextDonationTime) {
-      triggerDonationMessage();
+
+  // --- OUTBOUND DATA SERVICES ---
+  static WeatherRequest weatherRequest;
+  if (weatherRequest.apiKey != openWeatherApiKey ||
+      weatherRequest.city != openWeatherCity ||
+      weatherRequest.country != openWeatherCountry ||
+      weatherRequest.units != weatherUnits ||
+      weatherRequest.language != language) {
+    weatherRequest.apiKey = openWeatherApiKey;
+    weatherRequest.city = openWeatherCity;
+    weatherRequest.country = openWeatherCountry;
+    weatherRequest.units = weatherUnits;
+    weatherRequest.language = language;
+  }
+  static String snsSource;
+  if (snsSource != ntpServer2) snsSource = ntpServer2;
+  networkData.configure(weatherRequest, snsSource);
+  networkData.update(WiFi.status() == WL_CONNECTED, ntpSyncSuccessful, lastWifiConnectTime);
+
+  if (networkData.takeWeatherUpdate()) {
+    const WeatherData &weather = networkData.weather();
+    weatherAvailable = weather.available;
+    weatherFetched = weather.fetched;
+    if (weather.fetched) {
+      currentTemp = weather.temperature;
+      currentHumidity = weather.humidity;
+      mainDesc = weather.mainDescription;
+      detailedDesc = weather.detailedDescription;
+      weatherIcon = weather.icon;
+      weatherDescription = weatherIcon + " " + cleanTextForDisplay(detailedDesc);
+      sunriseHour = weather.sunriseHour;
+      sunriseMinute = weather.sunriseMinute;
+      sunsetHour = weather.sunsetHour;
+      sunsetMinute = weather.sunsetMinute;
+      Serial.printf("[WEATHER] Description used: %s\n", weatherDescription.c_str());
+      if (autoDimmingEnabled && sunriseHour >= 0 && sunsetHour >= 0) {
+        saveSunriseSunsetToConfig(sunriseHour, sunriseMinute, sunsetHour, sunsetMinute);
+      }
     }
   }
 
-  // --- MODIFIED WEATHER FETCHING LOGIC ---
-  if (WiFi.status() == WL_CONNECTED) {
-    if (!weatherFetchInitiated || shouldFetchWeatherNow || (millis() - lastFetch > fetchInterval)) {
-      if (shouldFetchWeatherNow) {
-        Serial.println(F("[LOOP] Immediate weather fetch requested by web server."));
-        shouldFetchWeatherNow = false;
-      } else if (!weatherFetchInitiated) {
-        Serial.println(F("[LOOP] Initial weather fetch."));
-      } else {
-        Serial.println(F("[LOOP] Regular interval weather fetch."));
-      }
-      weatherFetchInitiated = true;
-      weatherFetched = false;
-      fetchWeather();
-      lastFetch = millis();
-    }
-  } else {
-    weatherFetchInitiated = false;
-    shouldFetchWeatherNow = false;
+  if (networkData.takeNightscoutUpdate()) {
+    const NightscoutData &nightscout = networkData.nightscout();
+    currentGlucose = nightscout.glucose;
+    currentDirection = nightscout.direction;
+    lastGlucoseTime = nightscout.readingTime;
+    nightscoutMmol = nightscout.useMmol;
   }
 
-  // --- NIGHTSCOUT FETCH TIMER ---
-  SnsType snsTypeLoop = detectSnsType(String(ntpServer2));
-  if (snsTypeLoop == SNS_NIGHTSCOUT && WiFi.status() == WL_CONNECTED && ntpSyncSuccessful) {
-    if (millis() < nightscoutBackoffUntil) {
-      // backoff active (404 bad URL or 429 rate limit) — skip fetch entirely
-    } else if (currentGlucose == -1 || millis() - lastNightscoutFetchTime >= NIGHTSCOUT_FETCH_INTERVAL) {
-      fetchNightscout();
-      lastNightscoutFetchTime = millis();
-    }
-  }
-
-  // --- SNS (YouTube / Instagram / RSS) FETCH TIMER ---
-  if ((snsTypeLoop == SNS_YOUTUBE || snsTypeLoop == SNS_INSTAGRAM || snsTypeLoop == SNS_RSS) && WiFi.status() == WL_CONNECTED) {
-    if (lastSnsFetchTime == 0 || millis() - lastSnsFetchTime >= SNS_FETCH_INTERVAL) {
-
-      if (snsTypeLoop == SNS_YOUTUBE && !isNetworkBusy) {
-        isNetworkBusy = true;
-
-        // Grab the user input from the stored variable, stripping ESPTimeCast params first
-        String rawUrl = stripUrlParam(String(ntpServer2), "show_every");
-        String targetId = "";
-
-        // Check if the input contains an "@" handle
-        int atIndex = rawUrl.indexOf("@");
-        if (atIndex != -1) {
-          // Extract everything from the "@" to the end (e.g., "@linustech")
-          targetId = rawUrl.substring(atIndex);
-        }
-        // Check if it's a traditional channel URL
-        else if (rawUrl.indexOf("channel/") != -1) {
-          int channelIdx = rawUrl.indexOf("channel/");
-          targetId = rawUrl.substring(channelIdx + 8);
-        }
-        // Fallback: assume they pasted the raw ID directly
-        else {
-          targetId = rawUrl;
-        }
-
-        // Send the extracted ID or Handle to the PHP bridge
-        String bridgeUrl = "http://esptimecast.com/youtube-bridge.php?id=" + targetId;
-        Serial.println("[YOUTUBE] Fetching via PHP bridge: " + bridgeUrl);
-
-        WiFiClient client;
-        HTTPClient http;
-        http.begin(client, bridgeUrl);
-        http.setUserAgent("ESPTimeCast-Firmware");
-        http.setTimeout(4000);
-
-        int httpCode = http.GET();
-        if (httpCode == 200) {
-          String payload = http.getString();
-          payload.trim();
-
-          // Find the key inside the JSON payload
-          int subKeyIdx = payload.indexOf("\"subscribers\":");
-          if (subKeyIdx != -1) {
-            // Cut the string starting right after '"subscribers":'
-            String subValueStr = payload.substring(subKeyIdx + 14);
-
-            // Remove the closing brace '}' if any, and convert to integer
-            subValueStr.replace("}", "");
-            subValueStr.trim();
-
-            long parsedSubs = subValueStr.toInt();
-            if (parsedSubs >= 0) {
-              youtubeSubscribers = parsedSubs;
-              Serial.printf("[YOUTUBE] Subscribers fetched from JSON: %ld\n", youtubeSubscribers);
-            } else {
-              Serial.println("[YOUTUBE] Bridge JSON reported an error count (-1)");
-            }
-          } else {
-            Serial.println("[YOUTUBE] Failed to find 'subscribers' key in JSON payload");
-          }
-        } else {
-          Serial.printf("[YOUTUBE] HTTP failed! Code: %d, Message: %s\n", httpCode, http.errorToString(httpCode).c_str());
-        }
-
-        http.end();
-        isNetworkBusy = false;
-      }
-
-      if (snsTypeLoop == SNS_INSTAGRAM && !isNetworkBusy) {
-        isNetworkBusy = true;
-
-        // Grab the user input from the stored variable, stripping ESPTimeCast params first
-        String rawUrl = stripUrlParam(String(ntpServer2), "show_every");
-        String targetUsername = "";
-
-        // Pull the username out of an instagram.com/<username> URL if present
-        int igIdx = rawUrl.indexOf("instagram.com/");
-        if (igIdx != -1) {
-          targetUsername = rawUrl.substring(igIdx + 14);  // length of "instagram.com/"
-        } else {
-          // Fallback: assume they pasted the raw username (optionally with a leading @)
-          targetUsername = rawUrl;
-        }
-        if (targetUsername.startsWith("@")) targetUsername = targetUsername.substring(1);
-
-        // Trim off anything after the username itself (trailing slash, query string)
-        int slashIdx = targetUsername.indexOf('/');
-        if (slashIdx != -1) targetUsername = targetUsername.substring(0, slashIdx);
-        int qIdx = targetUsername.indexOf('?');
-        if (qIdx != -1) targetUsername = targetUsername.substring(0, qIdx);
-        targetUsername.trim();
-
-        // Send the extracted username to the PHP bridge
-        String bridgeUrl = "http://esptimecast.com/instagram-bridge.php?username=" + targetUsername;
-        Serial.println("[INSTAGRAM] Fetching via PHP bridge: " + bridgeUrl);
-
-        WiFiClient client;
-        HTTPClient http;
-        http.begin(client, bridgeUrl);
-        http.setUserAgent("ESPTimeCast-Firmware");
-        http.setTimeout(4000);
-
-        int httpCode = http.GET();
-        if (httpCode == 200) {
-          String payload = http.getString();
-          payload.trim();
-
-          // Find the key inside the JSON payload
-          int folKeyIdx = payload.indexOf("\"followers\":");
-          if (folKeyIdx != -1) {
-            // Cut the string starting right after '"followers":'
-            String folValueStr = payload.substring(folKeyIdx + 12);
-
-            // Remove the closing brace '}' if any, and convert to integer
-            folValueStr.replace("}", "");
-            folValueStr.trim();
-
-            long parsedFollowers = folValueStr.toInt();
-            if (parsedFollowers >= 0) {
-              instagramFollowers = parsedFollowers;
-              Serial.printf("[INSTAGRAM] Followers fetched from JSON: %ld\n", instagramFollowers);
-            } else {
-              Serial.println("[INSTAGRAM] Bridge JSON reported an error/not-found count (-1)");
-            }
-          } else {
-            Serial.println("[INSTAGRAM] Failed to find 'followers' key in JSON payload");
-          }
-        } else {
-          // Covers the bridge's 503 "blocked" response (Instagram rate-limited
-          // or login-walled us) as well as ordinary network failures — either
-          // way we just skip this cycle and retry next interval.
-          Serial.printf("[INSTAGRAM] HTTP failed! Code: %d, Message: %s\n", httpCode, http.errorToString(httpCode).c_str());
-        }
-
-        http.end();
-        isNetworkBusy = false;
-      }
-
-      if (snsTypeLoop == SNS_RSS && !isNetworkBusy) {
-        isNetworkBusy = true;
-
-        auto urlEncode = [](String str) -> String {
-          String encoded = "";
-          for (int i = 0; i < str.length(); i++) {
-            char c = str.charAt(i);
-            if (isalnum(c)) {
-              encoded += c;
-            } else {
-              char code1 = (c & 0xf) + '0';
-              if ((c & 0xf) > 9) code1 = (c & 0xf) - 10 + 'A';
-              char c2 = (c >> 4) & 0xf;
-              char code0 = c2 + '0';
-              if (c2 > 9) code0 = c2 - 10 + 'A';
-              encoded += '%';
-              encoded += code0;
-              encoded += code1;
-            }
-          }
-          return encoded;
-        };
-
-        // Strip show_every=N before passing to bridge (value already in BRIDGE_SHOW_EVERY via advanceDisplayMode)
-        String feedUrl = stripUrlParam(String(ntpServer2), "show_every");
-
-        String bridgeUrl = "http://esptimecast.com/rss-bridge.php?url=" + urlEncode(feedUrl);
-        Serial.println("[RSS] Fetching via PHP bridge: " + bridgeUrl);
-
-        WiFiClient client;
-        HTTPClient http;
-        http.begin(client, bridgeUrl);
-        http.setUserAgent("ESPTimeCast-Firmware");
-        http.setTimeout(4000);
-
-        int httpCode = http.GET();
-        if (httpCode == 200) {
-          String payload = http.getString();
-          payload.trim();
-          bool isError = (payload == "RSS ERROR" || payload == "INVALID RSS" || payload == "NO ENTRY" || payload == "FORBIDDEN" || payload == "NO URL" || payload == "INVALID URL");
-          if (!isError && payload.length() > 0) {
-            rssTitle = payload;
-            Serial.println("[RSS] Title fetched: " + rssTitle);
-          } else {
-            Serial.println("[RSS] Bridge returned error: " + payload);
-          }
-        } else {
-          Serial.printf("[RSS] HTTP failed! Code: %d\n", httpCode);
-        }
-
-        http.end();
-        isNetworkBusy = false;
-      }
-
-      lastSnsFetchTime = millis();
-    }
+  if (networkData.takeSnsUpdate()) {
+    const SnsData &sns = networkData.sns();
+    youtubeSubscribers = sns.youtubeSubscribers;
+    instagramFollowers = sns.instagramFollowers;
+    rssTitle = sns.rssTitle;
   }
 
   const char *const *daysOfTheWeek = getDaysOfWeek(language);
@@ -6135,8 +5175,7 @@ void loop() {
   }
 
   unsigned long currentMillis = millis();
-  unsigned long runtimeSeconds = (currentMillis - bootMillis) / 1000;
-  unsigned long currentTotal = totalUptimeSeconds + runtimeSeconds;
+  unsigned long currentTotal = getTotalRuntimeSeconds();
 
   // --- Log and save uptime every 10 minutes ---
   const unsigned long uptimeLogInterval = 600000UL;  // 10 minutes in ms

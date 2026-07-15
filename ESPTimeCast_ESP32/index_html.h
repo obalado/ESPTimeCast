@@ -867,13 +867,6 @@ const char index_html[] PROGMEM = R"rawliteral(
         line-height: 1.5;
       }
 
-      .donation-toggle-row { margin-top: 0.5rem; }
-
-      .donation-note {
-        font-size: 0.78rem;
-        color: rgba(255, 255, 255, 0.45);
-        margin: 1rem 0 0.5rem 0;
-      }
 
       #ota-container { text-align: center; }
 
@@ -1639,17 +1632,6 @@ const char index_html[] PROGMEM = R"rawliteral(
                 >Total Lifetime: <span id="totalDisplay">Loading...</span></span
               >
 
-              <hr class="donation-divider" />
-              <label class="toggle-row-lg donation-toggle-row">
-                <span class="label-text">Already supporting ESPTimeCast ❤️:</span>
-                <span class="toggle-switch">
-                  <input type="checkbox" id="hideDonationMsg" />
-                  <span class="toggle-slider"></span>
-                </span>
-              </label>
-              <p class="donation-note">
-                Turn this on to silence the occasional encouragement messages on your display.
-              </p>
 
               <hr />
               <div id="ota-container">
@@ -1826,14 +1808,6 @@ const char index_html[] PROGMEM = R"rawliteral(
 
             initClockOnlyDuringDimming(data);
 
-            // --- Donation message toggle ---
-            const hideDonationEl = document.getElementById("hideDonationMsg");
-            if (hideDonationEl) {
-              hideDonationEl.checked = !!data.hideDonationMsg;
-              hideDonationEl.addEventListener("change", function () {
-                setHideDonationMsg(this.checked);
-              });
-            }
 
             if (apiInputEl)
               apiInputEl.addEventListener("input", setDimmingFieldsEnabled);
@@ -2610,16 +2584,6 @@ const char index_html[] PROGMEM = R"rawliteral(
         });
       }
 
-      // --- Donation message opt-out toggle (no reboot) ---
-      function setHideDonationMsg(val) {
-        fetch("/set_hide_donation", {
-          method: "POST",
-          headers: { "Content-Type": "application/x-www-form-urlencoded" },
-          body: "value=" + (val ? 1 : 0),
-        }).catch((e) => {
-          console.error("Failed to set hideDonationMsg:", e);
-        });
-      }
 
       // Initialize the checkbox from cfg and wire up immediate save (no reboot)
       function initClockOnlyDuringDimming(cfg) {
