@@ -373,6 +373,21 @@ void advanceDisplayMode(bool forced = false);
 void previousDisplayMode(bool forced = false);
 void goToMode(const String &target);
 bool handlePomodoroCommand(String cmd);
+bool handleTimerCommand(String cmd);
+String cleanTextForDisplay(String str);
+void saveCustomMessageToConfig(const char *msg);
+void saveUptime();
+unsigned long getTotalRuntimeSeconds();
+String formatTotalRuntime();
+String formatUptime(unsigned long seconds);
+char getWeatherIconChar(const String &iconCode);
+void executeAction(const String &action, const String &value);
+void handleBrightnessChange(int newBrightness, bool isFromUI);
+void setupButtons();
+bool isModeAvailable(int mode);
+bool saveCountdownConfig(bool enabled, time_t targetTimestamp, const String &label);
+bool saveConfigRuntime();
+void showTimerMode7();
 
 // --- Safe WiFi credential and API getters ---
 const char *getSafeSsid() {
