@@ -2,14 +2,10 @@
 
 enum class NetworkError {
   None,
-  Busy,
   Disconnected,
   InvalidConfig,
-  LowMemory,
   HttpError,
-  ParseError,
-  NotFound,
-  RateLimited
+  ParseError
 };
 
 struct NetworkResult {

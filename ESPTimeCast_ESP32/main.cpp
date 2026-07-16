@@ -32,7 +32,6 @@ See LICENSE.txt for full terms.
 #include "storage/pin_store.h"
 #include "tz_lookup.h"      // Timezone lookup, do not duplicate mapping here!
 #include "index_html.h"     // Web UI
-#include "services/sns_utils.h"
 #include "network/network_data_coordinator.h"
 #include "storage/uptime_store.h"
 #include "storage/config_store.h"
@@ -78,24 +77,12 @@ NetworkDataCoordinator networkData;
 
 // --- Global Scroll Speed Settings ---
 const int GENERAL_SCROLL_SPEED = 85;  // Default: Adjust this for Weather Description and Countdown Label (e.g., 50 for faster, 200 for slower)
-const int RSS_SCROLL_SPEED = 65;      // Faster than general scroll for RSS headlines
 int IP_SCROLL_SPEED = 115;            // Default: Adjust this for the IP Address display (slower for readability)
 int messageScrollSpeed = 85;          // default fallback
 
 // Central controller owns mode IDs, previous mode, rotation position, and timing.
 DisplayController displayController;
 
-// --- Network data snapshots used by display and status APIs ---
-const unsigned int NIGHTSCOUT_IDLE_THRESHOLD_MIN = 10;
-int currentGlucose = -1;
-String currentDirection = "?";
-time_t lastGlucoseTime = 0;
-bool nightscoutMmol = false;
-long youtubeSubscribers = -1;
-long instagramFollowers = -1;
-String rssTitle = "";
-int BRIDGE_SHOW_EVERY = 3;
-int bridgeRotationCount = 0;
 
 // --- Device identity ---
 const char *DEFAULT_HOSTNAME = "esptimecast";
@@ -137,7 +124,7 @@ bool showDate = false;
 bool showHumidity = false;
 bool colonBlinkEnabled = true;
 char ntpServer1[64] = "pool.ntp.org";
-char ntpServer2[256] = "time.nist.gov";
+char ntpServer2[64] = "time.nist.gov";
 char customMessage[121] = "";
 char lastPersistentMessage[128] = "";
 int messageDisplaySeconds;
@@ -551,7 +538,16 @@ void loadConfig() {
   sunsetMinute = doc["sunsetMinute"] | 0;
 
   strlcpy(ntpServer1, doc["ntpServer1"] | "pool.ntp.org", sizeof(ntpServer1));
-  strlcpy(ntpServer2, doc["ntpServer2"] | "time.nist.gov", sizeof(ntpServer2));
+  String configuredNtpServer2 = doc["ntpServer2"] | "time.nist.gov";
+  configuredNtpServer2.trim();
+  if (configuredNtpServer2.startsWith("http://") || configuredNtpServer2.startsWith("https://")) {
+    strlcpy(ntpServer2, "time.nist.gov", sizeof(ntpServer2));
+    doc["ntpServer2"] = ntpServer2;
+    configChanged = true;
+    Serial.println(F("[CONFIG] Removed legacy integration URL; restored secondary NTP default."));
+  } else {
+    strlcpy(ntpServer2, configuredNtpServer2.c_str(), sizeof(ntpServer2));
+  }
 
   if (strcmp(weatherUnits, "imperial") == 0)
     tempSymbol = '\007';
@@ -1934,18 +1930,11 @@ void setupWebServer() {
     doc["displayBusy"] = (displayMode == 6 || displayMode == 7);
     doc["allowInterrupt"] = allowInterrupt;
 
-    SnsType snsType = detectSnsType(String(ntpServer2));
     switch (displayMode) {
       case 0: doc["mode"] = "clock"; break;
       case 1: doc["mode"] = "weather"; break;
       case 2: doc["mode"] = "weather_desc"; break;
       case 3: doc["mode"] = "countdown"; break;
-      case 4:
-        if (snsType == SNS_YOUTUBE) doc["mode"] = "youtube";
-        else if (snsType == SNS_INSTAGRAM) doc["mode"] = "instagram";
-        else if (snsType == SNS_RSS) doc["mode"] = "rss";
-        else doc["mode"] = "nightscout";
-        break;
       case 5: doc["mode"] = "date"; break;
       case 6: doc["mode"] = "message"; break;
       case 7: doc["mode"] = "timer"; break;
@@ -2012,41 +2001,6 @@ void setupWebServer() {
                                ? currentWeatherCode : JsonVariant();
     weather["provider"] = String(weatherProvider);
 
-    // --- Nightscout info ---
-#if defined(ESP32) || defined(ESP8266)
-    JsonObject ns = doc["nightscout"].to<JsonObject>();
-    ns["active"] = (displayMode == 4);
-    if (currentGlucose != -1) ns["glucose"] = currentGlucose;
-    else ns["glucose"] = nullptr;
-    if (currentDirection.length() > 0 && currentDirection != "?") ns["trend"] = currentDirection;
-    else ns["trend"] = nullptr;
-
-    if (lastGlucoseTime > 0) {
-      ns["lastReadingEpoch"] = lastGlucoseTime;
-      time_t nowUTC = time(nullptr);
-      int minutes = static_cast<int>(difftime(nowUTC, lastGlucoseTime) / 60.0);
-      ns["minutesSinceReading"] = (minutes > 0) ? minutes : 0;
-      ns["isOutdated"] = (minutes > NIGHTSCOUT_IDLE_THRESHOLD_MIN);
-    } else {
-      ns["lastReadingEpoch"] = nullptr;
-      ns["minutesSinceReading"] = nullptr;
-      ns["isOutdated"] = true;
-    }
-#endif
-
-    // --- SNS info (YouTube / Instagram) ---
-    JsonObject sns = doc["sns"].to<JsonObject>();
-    switch (snsType) {
-      case SNS_YOUTUBE: sns["type"] = "youtube"; break;
-      case SNS_INSTAGRAM: sns["type"] = "instagram"; break;
-      case SNS_NIGHTSCOUT: sns["type"] = "nightscout"; break;
-      case SNS_RSS: sns["type"] = "rss"; break;
-      default: sns["type"] = "none"; break;
-    }
-    sns["youtubeSubscribers"] = (youtubeSubscribers >= 0) ? youtubeSubscribers : JsonVariant();
-    sns["instagramFollowers"] = (instagramFollowers >= 0) ? instagramFollowers : JsonVariant();
-    sns["rssTitle"] = (rssTitle.length() > 0) ? rssTitle : JsonVariant();
-
     // --- Saved Config ---
     JsonObject config = doc["config"].to<JsonObject>();
     config["ssid"] = String(ssid);
@@ -2067,16 +2021,7 @@ void setupWebServer() {
     config["showHumidity"] = showHumidity;
     config["ntpServer1"] = String(ntpServer1);
 
-    String nsUrl = String(ntpServer2);
-    int tokenIdx = nsUrl.indexOf("token=");
-    if (tokenIdx == -1) tokenIdx = nsUrl.indexOf("api_key=");
-
-    if (tokenIdx != -1) {
-      int keyStart = nsUrl.indexOf('=', tokenIdx) + 1;
-      config["ntpServer2"] = nsUrl.substring(0, keyStart) + "***HIDDEN***";
-    } else {
-      config["ntpServer2"] = nsUrl;
-    }
+    config["ntpServer2"] = String(ntpServer2);
 
     // --- Dimming ---
     JsonObject dimming = doc["dimming"].to<JsonObject>();
@@ -3359,7 +3304,7 @@ DisplayMode key:
   1: Weather
   2: Weather Description
   3: Countdown
-  4: Bridge
+  4: Reserved (removed integration mode)
   5: Date
   6: Custom Message
 */
@@ -3546,17 +3491,7 @@ void advanceDisplayMode(bool forced) {
   // ---- SAFE ROTATION ENGINE ----
   for (size_t i = 0; i < kDisplayModeOrderCount; i++) {
     const DisplayMode nextDisplayMode = displayController.nextCandidate();
-    const int nextMode = displayModeId(nextDisplayMode);
 
-    // --- Bridge mode throttle (YouTube, Nightscout, and RSS) ---
-    if (nextMode == 4) {
-      BRIDGE_SHOW_EVERY = parseBridgeShowEvery(String(ntpServer2));
-      if (bridgeRotationCount % BRIDGE_SHOW_EVERY != 0) {
-        bridgeRotationCount++;
-        continue;
-      }
-      bridgeRotationCount++;
-    }
 
     if (isModeAvailable(nextDisplayMode)) {
       if (displayMode == 6 || displayMode == 2 || displayMode == 3) {
@@ -3597,7 +3532,6 @@ void previousDisplayMode(bool forced) {
 
   for (size_t i = 0; i < kDisplayModeOrderCount; i++) {
     const DisplayMode nextDisplayMode = displayController.previousCandidate();
-    const int nextMode = displayModeId(nextDisplayMode);
 
     if (isModeAvailable(nextDisplayMode)) {
       if (displayMode == 6 || displayMode == 2 || displayMode == 3) {
@@ -3622,7 +3556,6 @@ void previousDisplayMode(bool forced) {
 }
 
 bool isModeAvailable(DisplayMode mode) {
-  const SnsType snsType = detectSnsType(String(ntpServer2));
   switch (mode) {
     case DisplayMode::Clock: return true;
     case DisplayMode::Weather: return weatherConfigurationValid();
@@ -3630,7 +3563,7 @@ bool isModeAvailable(DisplayMode mode) {
       return showWeatherDescription && weatherAvailable && weatherDescription.length() > 0;
     case DisplayMode::Countdown:
       return countdownEnabled && !countdownFinished && ntpSyncSuccessful;
-    case DisplayMode::Bridge: return snsType != SNS_NTP;
+    case DisplayMode::Reserved: return false;
     case DisplayMode::Date: return showDate && ntpSyncSuccessful;
     case DisplayMode::Message: return strlen(customMessage) > 0;
     case DisplayMode::Timer: return timerActive;
@@ -4066,10 +3999,8 @@ void loop() {
     weatherRequest.language = language;
     weatherRequest.timezone = timeZone;
   }
-  static String snsSource;
-  if (snsSource != ntpServer2) snsSource = ntpServer2;
-  networkData.configure(weatherRequest, snsSource);
-  networkData.update(WiFi.status() == WL_CONNECTED, ntpSyncSuccessful, lastWifiConnectTime);
+  networkData.configure(weatherRequest);
+  networkData.update(WiFi.status() == WL_CONNECTED, lastWifiConnectTime);
 
   if (networkData.takeWeatherUpdate()) {
     const WeatherData &weather = networkData.weather();
@@ -4098,20 +4029,6 @@ void loop() {
     }
   }
 
-  if (networkData.takeNightscoutUpdate()) {
-    const NightscoutData &nightscout = networkData.nightscout();
-    currentGlucose = nightscout.glucose;
-    currentDirection = nightscout.direction;
-    lastGlucoseTime = nightscout.readingTime;
-    nightscoutMmol = nightscout.useMmol;
-  }
-
-  if (networkData.takeSnsUpdate()) {
-    const SnsData &sns = networkData.sns();
-    youtubeSubscribers = sns.youtubeSubscribers;
-    instagramFollowers = sns.instagramFollowers;
-    rssTitle = sns.rssTitle;
-  }
 
   // Run deferred config writes before mode renderers, many of which return early.
   if (configDirty && millis() - lastBrightnessChange > saveDelay) {
@@ -4210,7 +4127,7 @@ void loop() {
 
       // --- SCROLL IN ONLY WHEN COMING FROM SPECIFIC MODES OR FIRST BOOT ---
       bool shouldScrollIn = false;
-      if (prevDisplayMode == -1 || prevDisplayMode == 3 || prevDisplayMode == 4) {
+      if (prevDisplayMode == -1 || prevDisplayMode == 3) {
         shouldScrollIn = true;  // first boot or other special modes
       } else if (prevDisplayMode == 2 && weatherDescription.length() > 8) {
         shouldScrollIn = true;  // only scroll in if weather was scrolling
@@ -4679,264 +4596,8 @@ void loop() {
   }  // End of if (displayMode == 3 && ...)
 
 
-  // --- BRIDGE Display Mode ---
-  if (displayMode == 4) {
-    if (forceMessageRestart) return;
-    SnsType snsType = detectSnsType(String(ntpServer2));
-
-    if (snsType == SNS_YOUTUBE || snsType == SNS_INSTAGRAM) {
-      long count = (snsType == SNS_YOUTUBE) ? youtubeSubscribers : instagramFollowers;
-      char icon = (snsType == SNS_YOUTUBE) ? 157 : 155;
-
-      if (count < 0) {
-        P.setTextAlignment(PA_CENTER);
-        P.setCharSpacing(0);
-
-        String displayText = "";
-        displayText += icon;
-        displayText += " - - ";
-
-        P.print(displayText.c_str());
-
-        unsigned long snsStart = millis();
-        while (millis() - snsStart < weatherDuration) {
-          if (displayMode != 4) return;
-          if (forceMessageRestart) return;
-          yield();
-        }
-
-        advanceDisplayMode();
-        return;
-      }
-
-      String countStr;
-
-      if (count < 10000) {
-        countStr = String(count);
-      } else if (count < 100000) {
-        float v = count / 1000.0f;
-        countStr = (v == (int)v) ? String((int)v) : String(v, 1);
-        countStr += char(193);  // K
-      } else if (count < 1000000) {
-        countStr = String(count / 1000);
-        countStr += char(193);  // K
-      } else if (count < 100000000) {
-        float v = count / 1000000.0f;
-        countStr = (v == (int)v) ? String((int)v) : String(v, 1);
-        countStr += char(192);  // M
-      } else {
-        countStr = String(count / 1000000);
-        countStr += char(192);  // M
-      }
-
-      if (countStr.length() <= 5) {
-        // --- STATIC: icon + up to 5 digits fits the 32px display ---
-        P.setTextAlignment(PA_CENTER);
-        P.setCharSpacing(0);  // explicit 2px gap below, not auto-spacing
-        String iconStr = String(icon) + " ";
-        // 1. Manually add a 1px space between each digit of the number
-        String spacedCountStr = "";
-        for (unsigned int i = 0; i < countStr.length(); i++) {
-          spacedCountStr += countStr[i];
-          if (i < countStr.length() - 1) {
-            spacedCountStr += " ";  // Inject a 1px font space between digits
-          }
-        }
-        String endpaddedCount = String(spacedCountStr) + " ";
-        String displayText = String(iconStr) + " " + endpaddedCount;
-        P.print(displayText.c_str());
-
-        unsigned long snsStart = millis();
-        while (millis() - snsStart < weatherDuration) {
-          if (displayMode != 4) return;
-          if (forceMessageRestart) return;
-          yield();
-        }
-        advanceDisplayMode();
-        return;
-      }
-
-      // --- SCROLL: more than 5 digits, same technique as Custom Message ---
-      P.setTextAlignment(PA_LEFT);
-      P.setCharSpacing(0);  // explicit 2px gap below, not auto-spacing
-      String iconStr = String(icon) + " ";
-      // 1. Manually add a 1px space between each digit of the number
-      String spacedCountStr = "";
-      for (unsigned int i = 0; i < countStr.length(); i++) {
-        spacedCountStr += countStr[i];
-        if (i < countStr.length() - 1) {
-          spacedCountStr += " ";  // Inject a 1px font space between digits
-        }
-      }
-      String scrollText = String(iconStr) + " " + spacedCountStr;
-      textEffect_t actualScrollDirection = getEffectiveScrollDirection(PA_SCROLL_LEFT, flipDisplay);
-      P.displayScroll(scrollText.c_str(), PA_LEFT, actualScrollDirection, GENERAL_SCROLL_SPEED);
-
-      while (!P.displayAnimate()) {
-        if (displayMode != 4) return;
-        if (forceMessageRestart) return;
-        yield();
-      }
-
-      advanceDisplayMode();
-      return;
-    }
-
-    // --- RSS display ---
-    if (snsType == SNS_RSS) {
-      P.setCharSpacing(1);
-      char charIcon = 194;
-      String rssIcon = String(charIcon) + " ";
-
-      if (rssTitle.length() == 0) {
-        // Not yet fetched
-        P.setTextAlignment(PA_CENTER);
-        P.setCharSpacing(0);
-        String waitText = String(rssIcon) + " - -";
-        P.print(waitText.c_str());
-        unsigned long rssStart = millis();
-        while (millis() - rssStart < weatherDuration) {
-          if (displayMode != 4) return;
-          if (forceMessageRestart) return;
-          yield();
-        }
-        advanceDisplayMode();
-        return;
-      }
-
-      // Title is ready — remap digits to small font glyphs, then scroll
-      String rssDisplay = rssTitle;
-      for (int i = 0; i < rssDisplay.length(); i++) {
-        if (isDigit(rssDisplay[i])) {
-          int num = rssDisplay[i] - '0';
-          rssDisplay[i] = 145 + ((num + 9) % 10);
-        }
-      }
-
-      textEffect_t actualScrollDirection = getEffectiveScrollDirection(PA_SCROLL_LEFT, flipDisplay);
-
-      // Padding logic (same as weather scroll)
-      bool addPadding = false;
-      bool humidityVisible = showHumidity && weatherAvailable && weatherConfigurationValid();
-      if (prevDisplayMode == 0 && (showDayOfWeek || colonBlinkEnabled)) {
-        addPadding = true;
-      } else if (prevDisplayMode == 1 && humidityVisible) {
-        addPadding = true;
-      }
-      String scrollText = String(rssIcon) + rssDisplay;
-      if (addPadding) {
-        scrollText = "   " + scrollText;  // 3 spaces
-      }
-      P.setTextAlignment(PA_LEFT);
-      P.setCharSpacing(1);
-      P.displayScroll(scrollText.c_str(), PA_LEFT, actualScrollDirection, RSS_SCROLL_SPEED);
-      while (!P.displayAnimate()) {
-        if (displayMode != 4) return;
-        if (forceMessageRestart) return;
-        yield();
-      }
-      advanceDisplayMode();
-      return;
-    }
-
-    P.setCharSpacing(1);
-
-    if (currentGlucose != -1) {
-      time_t nowUTC = time(nullptr);
-
-      bool isOutdated = false;
-      int ageMinutes = 0;
-
-      if (lastGlucoseTime > 0) {
-        double diffSec = difftime(nowUTC, lastGlucoseTime);
-        ageMinutes = (int)(diffSec / 60.0);
-        isOutdated = (ageMinutes > NIGHTSCOUT_IDLE_THRESHOLD_MIN);
-        Serial.printf("[NIGHTSCOUT] Data age: %d minutes old (threshold: %d)\n", ageMinutes, NIGHTSCOUT_IDLE_THRESHOLD_MIN);
-      }
-
-      char arrow;
-      if (currentDirection == "Flat") arrow = 139;
-      else if (currentDirection == "SingleUp") arrow = 134;
-      else if (currentDirection == "DoubleUp") arrow = 135;
-      else if (currentDirection == "SingleDown") arrow = 136;
-      else if (currentDirection == "DoubleDown") arrow = 137;
-      else if (currentDirection == "FortyFiveUp") arrow = 138;
-      else if (currentDirection == "FortyFiveDown") arrow = 140;
-      else arrow = '?';
-
-      // --- Build glucose display string ---
-      String glucoseDisplay;
-      if (nightscoutMmol) {
-        char tmp[8];
-        dtostrf(currentGlucose / 18.018f, 4, 1, tmp);
-        glucoseDisplay = String(tmp);
-        glucoseDisplay.trim();
-      } else {
-        glucoseDisplay = String(currentGlucose);
-      }
-
-      String displayText = "";
-      if (isOutdated) {
-        // First pass: convert digits to dimmed variants, dot to char(206)
-        String styledStr = "";
-        for (int i = 0; i < glucoseDisplay.length(); i++) {
-          char c = glucoseDisplay[i];
-          if (c == '.') {
-            styledStr += char(206);  // mid-line dot for decimal point
-          } else if (isDigit(c)) {
-            int num = c - '0';
-            styledStr += char(195 + ((num + 9) % 10));  // dimmed digit
-          } else {
-            styledStr += c;
-          }
-        }
-
-        // Second pass: wrap and separate every character with char(205)
-        // Result: (205)(char)(205)(char)(205)...(char)(205)
-        String separatedStr = "";
-        separatedStr += char(205);  // leading cap
-        for (int i = 0; i < styledStr.length(); i++) {
-          separatedStr += styledStr[i];
-          separatedStr += char(205);  // after every character including last
-        }
-
-        displayText += separatedStr;
-        displayText += " ";
-        displayText += arrow;
-        P.setCharSpacing(0);
-      } else {
-        displayText += glucoseDisplay + String(arrow);
-        P.setCharSpacing(1);
-      }
-
-      P.setTextAlignment(PA_CENTER);
-      P.print(displayText.c_str());
-      unsigned long nightscoutStart = millis();
-      while (millis() - nightscoutStart < weatherDuration) {
-        if (displayMode != 4) return;
-        if (forceMessageRestart) return;
-        yield();
-      }
-      advanceDisplayMode();
-      return;
-    } else {
-      P.setTextAlignment(PA_CENTER);
-      P.setCharSpacing(0);
-      P.write(15);
-      unsigned long errorStart = millis();
-      while (millis() - errorStart < 2000) {
-        if (displayMode != 4) return;
-        if (forceMessageRestart) return;
-        yield();
-      }
-      advanceDisplayMode();
-      return;
-    }
-  }
-
-
   // DATE Display Mode
-  else if (displayMode == 5 && showDate) {
+  if (displayMode == 5 && showDate) {
     if (forceMessageRestart) return;
 
     if (!validDisplayDate(timeinfo)) {

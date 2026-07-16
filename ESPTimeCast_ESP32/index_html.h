@@ -1294,14 +1294,14 @@ const char index_html[] PROGMEM = R"rawliteral(
               placeholder="Enter NTP address"
             />
 
-            <label>Secondary NTP Server / Integration URL:</label>
+            <label>Secondary NTP Server:</label>
             <input
               type="text"
               name="ntpServer2"
               id="ntpServer2"
-              placeholder="Enter URL"
+              placeholder="Enter NTP hostname"
+              maxlength="63"
             />
-            <div class="small">Enter a Nightscout URL, YouTube channel URL or secondary NTP server.</div>
 
             <div class="toggles toggle-padding">
               <label class="toggle-row-lg">

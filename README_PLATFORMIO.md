@@ -115,8 +115,8 @@ Device reboots automatically after successful update.
 ```text
 ESPTimeCast_ESP32/main.cpp             Firmware entry point and orchestration
 ESPTimeCast_ESP32/display/              Mode IDs/controller plus date, clock, and weather formatting
-ESPTimeCast_ESP32/network/              Async weather, Nightscout, SNS, request gating, and fetch scheduling
-ESPTimeCast_ESP32/services/             Pure feed and weather utilities
+ESPTimeCast_ESP32/network/              Async weather, request gating, and fetch scheduling
+ESPTimeCast_ESP32/services/             Pure weather utilities
 ESPTimeCast_ESP32/storage/              Config, pin, and uptime persistence
 ESPTimeCast_ESP32/*.h                   Embedded UI, fonts, lookups, and version
 platformio.ini                          Build environments and dependencies

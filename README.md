@@ -189,9 +189,7 @@ Advanced and developer-focused information is available below.
   - Adjustable **brightness**  
   - **Auto dimming** (sunrise/sunset) or custom schedule  
 
-- **Optional Integrations:**
-  - **Nightscout glucose display** with mg/dL and mmol/L support (alternates with weather)
-  - **Config export/import** via `/export` and `/upload` endpoints  
+- **Config export/import** via `/export` and `/upload` endpoints
     
   &nbsp;
 </details>
@@ -490,7 +488,7 @@ POST http://<device_ip>/action
 |-----------|-------|-------------|
 | `next_mode` | -- | Advance to next display mode |
 | `prev_mode` | -- | Go to previous display mode |
-| `go_to_mode` | `0`–`7` or name | Jump to an available mode: `clock`, `weather`, `description`/`weather_desc`, `countdown`, `bridge`/`nightscout`, `date`, `message`, `timer` |
+| `go_to_mode` | `0`–`3`, `5`–`7`, or name | Jump to an available mode: `clock`, `weather`, `description`/`weather_desc`, `countdown`, `date`, `message`, `timer` |
 | `enable_rotation` | `0` or `1` (optional) | Freeze or resume automatic rotation. Toggles if no value sent. |
 
 #### 🔆 Display & Brightness
@@ -998,76 +996,6 @@ action:
 &nbsp;
 </details>
 <details>
-<summary>📡 Bridge Mode (YouTube, RSS, Nightscout)</summary>
-&nbsp;
-
-ESPTimeCast can display live data from external services using the secondary NTP/URL field (`ntpServer2`). The device automatically detects which service to connect to based on the URL you enter, no extra configuration needed. Paste your URL into the field and the device does the rest.  
-
-### 📺 Bridge Mode Display Frequency
-
-By default, **Bridge Mode** is shown once every display rotation. You can change how often it appears by adding the `&show_every=X` parameter to your URL.
-
-| URL | Behaviour |
-|-----|-----------|
-| `https://your-integration-url.com` | Every rotation (default) |
-| `https://your-integration-url.com&show_every=3` | Every 3 rotations |
-| `https://your-integration-url.com&show_every=5` | Every 5 rotations |
-
-The `show_every` parameter works with **all Bridge Mode sources**, including **RSS feeds, YouTube subscriber counters, and Nightscout**. The parameter is stripped from the URL before the request is forwarded to the bridge or external service.
-
-### 📺 YouTube Subscriber Counter
-
-Paste any YouTube channel URL or handle into the `ntpServer2` field:  
-
-`https://www.youtube.com/@mkbhd`  
-`https://www.youtube.com/channel/UCxxxxxxxxxxxxxx`  
-
-The subscriber count is fetched via a PHP bridge, formatted to fit the display (e.g. `42.1K`, `3.5M`), and shown with the YouTube icon. Data is refreshed every hour.
-
-### 📰 RSS Feed Headlines
-
-Paste any RSS, Atom, or RDF feed URL into the `ntpServer2` field:  
-
-`https://hackaday.com/feed`  
-`https://feeds.bbci.co.uk/news/rss.xml`  
-`https://www.nasa.gov/rss/dyn/breaking_news.rss`  
-
-The title of the most recent article scrolls across the display with the RSS icon. Most standard feed formats are detected automatically — if the URL contains `feed`, `rss`, or `atom`, or ends in `.rss` / `.atom`, it will be picked up correctly.
-
-### ⚕️ Nightscout Integration
-
-Paste your Nightscout API endpoint into the `ntpServer2` field:  
-
-`https://your-cgm-server/api/v1/entries/current.json?token=xxxxxxxxxxxxx`  
-
-### Unit Selection: mg/dL and mmol/L
-
-By default, glucose is displayed in **mg/dL**. To display in **mmol/L**, add `&mmol=1` to your Nightscout URL:  
-
-`https://your-cgm-server/api/v1/entries/current.json?token=xxxxxxxxxxxxx&mmol=1`  
-
-The conversion (`mg/dL ÷ 18.018`) is handled automatically on the device. No other changes are needed.
-
-- Glucose value and trend arrow are displayed alternately with time and weather
-- **Outdated data** (older than 10 minutes) is shown with dimmed characters so you can tell at a glance the reading is stale
-- Display duration matches the weather display duration setting
-- Data is fetched every 2.5 minutes
-
-### ⚠️ ESP8266 vs ESP32
-
-> **ESP32 is strongly recommended for Nightscout users.**
-
-| | ESP8266 | ESP32 |
-|---|---|---|
-| Connection | Via PHP bridge (HTTP) | Direct HTTPS |
-| Reliability | Good | Excellent |
-| Setup | Standard URL | Standard URL |
-
-The ESP8266 connects to Nightscout via an intermediate PHP bridge due to TLS memory constraints. While functional, **ESP32 provides a more stable and direct connection** and is the recommended platform for anyone using Nightscout.
-
-&nbsp;
-</details>
-<details>
 <summary>🧩 Power User Features</summary>
 &nbsp;
 
@@ -1111,7 +1039,7 @@ http://your-device-ip/upload
 <summary>📺 How the Display Works</summary>
 &nbsp;
 
-**ESPTimeCast™** rotates through available modes in this order: Clock, Date, Weather, Description, Countdown, Bridge, and Custom Message. Disabled or unavailable modes are skipped; Timer temporarily overrides rotation while active.
+**ESPTimeCast™** rotates through available modes in this order: Clock, Date, Weather, Description, Countdown, and Custom Message. Disabled or unavailable modes are skipped; Timer temporarily overrides rotation while active.
 If "Show Weather Description" is enabled, Description displays for 3 seconds when short. Long descriptions scroll from right to left once.
 
 What you see on the LED matrix depends on whether the device has successfully fetched current time via NTP and weather from the selected provider.
