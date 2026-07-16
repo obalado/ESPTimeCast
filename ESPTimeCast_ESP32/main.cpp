@@ -4221,16 +4221,11 @@ void loop() {
     if (forceMessageRestart) return;
     String desc = weatherDescription;
 
-    // --- Check if humidity is actually visible ---
-    bool humidityVisible = showHumidity && weatherAvailable && weatherConfigurationValid();
-
-    // --- Conditional padding ---
-    bool addPadding = false;
-    if (prevDisplayMode == 1 && humidityVisible) {
-      addPadding = true;
-    }
-    if (addPadding) {
-      desc = "    " + desc;  // 4-space padding before scrolling
+    // Add separation only when text already needs scrolling. Short WMO labels
+    // must remain unpadded so they fit on one screen.
+    const bool humidityVisible = showHumidity && weatherAvailable && weatherConfigurationValid();
+    if (prevDisplayMode == 1 && humidityVisible && desc.length() > 8) {
+      desc = "    " + desc;
     }
 
     // prepare safe buffer
