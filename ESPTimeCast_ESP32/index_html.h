@@ -1137,6 +1137,17 @@ const char index_html[] PROGMEM = R"rawliteral(
           />
           <label class="small">(Seconds)</label>
         </div>
+        <div>
+          <label for="dateDuration">Date Duration</label>
+          <input
+            type="number"
+            id="dateDuration"
+            name="dateDuration"
+            min="1"
+            required
+          />
+          <label class="small">(Seconds)</label>
+        </div>
       </div>
 
       <h2 class="no-ap">Weather Settings</h2>
@@ -1777,6 +1788,8 @@ const char index_html[] PROGMEM = R"rawliteral(
               (data.clockDuration || 10000) / 1000;
             document.getElementById("weatherDuration").value =
               (data.weatherDuration || 5000) / 1000;
+            document.getElementById("dateDuration").value =
+              (data.dateDuration || data.weatherDuration || 5000) / 1000;
             document.getElementById("language").value = data.language || "";
 
             // --- Advanced: brightness ---
@@ -1995,8 +2008,10 @@ const char index_html[] PROGMEM = R"rawliteral(
         const clockDuration = parseInt(formData.get("clockDuration")) * 1000;
         const weatherDuration =
           parseInt(formData.get("weatherDuration")) * 1000;
+        const dateDuration = parseInt(formData.get("dateDuration")) * 1000;
         formData.set("clockDuration", clockDuration);
         formData.set("weatherDuration", weatherDuration);
+        formData.set("dateDuration", dateDuration);
 
         let apiKeyToSend = apiInput.value;
 

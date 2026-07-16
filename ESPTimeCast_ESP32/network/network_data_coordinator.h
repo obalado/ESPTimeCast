@@ -25,6 +25,8 @@ class NetworkDataCoordinator {
 
  private:
   void updateWeather(unsigned long now, unsigned long connectedAt);
+  void collectWeatherResult();
+  static void weatherTaskEntry(void *parameter);
   void updateNightscout(unsigned long now, SnsType type);
   void updateSns(unsigned long now, SnsType type);
 
@@ -48,6 +50,9 @@ class NetworkDataCoordinator {
   bool weatherChanged_ = false;
   bool nightscoutChanged_ = false;
   bool snsChanged_ = false;
+  bool weatherTaskRunning_ = false;
+  void *pendingWeatherResult_ = nullptr;
+  portMUX_TYPE weatherResultMux_ = portMUX_INITIALIZER_UNLOCKED;
   unsigned long lastWeatherFetch_ = 0;
   unsigned long lastNightscoutFetch_ = 0;
   unsigned long lastSnsFetch_ = 0;

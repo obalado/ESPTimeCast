@@ -25,10 +25,12 @@ See LICENSE.txt for full terms.
 #include <Update.h>
 #include "version.h"
 #include "mfactoryfont.h"
+#include "display/display_mode.h"
+#include "display/display_controller.h"
+#include "display/date_time_formatter.h"
+#include "display/weather_formatter.h"
 #include "storage/pin_store.h"
 #include "tz_lookup.h"      // Timezone lookup, do not duplicate mapping here!
-#include "days_lookup.h"    // Languages for the Days of the Week
-#include "months_lookup.h"  // Languages for the Months of the Year
 #include "index_html.h"     // Web UI
 #include "services/sns_utils.h"
 #include "network/network_data_coordinator.h"
@@ -80,19 +82,8 @@ const int RSS_SCROLL_SPEED = 65;      // Faster than general scroll for RSS head
 int IP_SCROLL_SPEED = 115;            // Default: Adjust this for the IP Address display (slower for readability)
 int messageScrollSpeed = 85;          // default fallback
 
-// Order for safe advance display mode
-const uint8_t modeOrder[] = {
-  0,  // CLOCK
-  5,  // DATE
-  1,  // WEATHER
-  2,  // WEATHER DESCRIPTION
-  3,  // COUNTDOWN
-  4,  // BRIDGE
-  6   // CUSTOM MESSAGE
-};
-
-const uint8_t MODE_COUNT = sizeof(modeOrder) / sizeof(modeOrder[0]);
-uint8_t modeIndex = 0;
+// Central controller owns mode IDs, previous mode, rotation position, and timing.
+DisplayController displayController;
 
 // --- Network data snapshots used by display and status APIs ---
 const unsigned int NIGHTSCOUT_IDLE_THRESHOLD_MIN = 10;
@@ -135,6 +126,7 @@ bool isRebooting = false;
 // Timing and display settings
 unsigned long clockDuration = 10000;
 unsigned long weatherDuration = 5000;
+unsigned long dateDuration = 5000;
 bool displayOff = false;
 int brightness = 7;
 int lastBrightnessBeforeOff = 7;  // remembers brightness to restore on display_on
@@ -211,10 +203,10 @@ bool weatherFetched = false;
 bool isAPMode = false;
 char tempSymbol = '\006';
 
-unsigned long lastSwitch = 0;
+unsigned long &lastSwitch = displayController.switchedAt;
 unsigned long lastColonBlink = 0;
-int displayMode = 0;  // 0: Clock, 1: Weather, 2: Weather Description, 3: Countdown
-int prevDisplayMode = -1;
+int &displayMode = displayController.current;
+int &prevDisplayMode = displayController.previous;
 bool clockScrollDone = false;
 int currentHumidity = -1;
 bool ntpSyncSuccessful = false;
@@ -310,7 +302,7 @@ String cleanTextForDisplay(String str);
 void executeAction(const String &action, const String &value);
 void handleBrightnessChange(int newBrightness, bool isFromUI);
 void setupButtons();
-bool isModeAvailable(int mode);
+bool isModeAvailable(DisplayMode mode);
 bool saveCountdownConfig(bool enabled, time_t targetTimestamp, const String &label);
 bool saveConfigRuntime();
 bool weatherConfigurationValid();
@@ -385,6 +377,7 @@ void loadConfig() {
     doc[F("weatherLongitude")] = "";
     doc[F("clockDuration")] = 10000;
     doc[F("weatherDuration")] = 5000;
+    doc[F("dateDuration")] = 5000;
     doc[F("timeZone")] = "";
     doc[F("language")] = "en";
     doc[F("brightness")] = brightness;
@@ -494,6 +487,7 @@ void loadConfig() {
   strlcpy(lastPersistentMessage, customMessage, sizeof(lastPersistentMessage));
   clockDuration = doc["clockDuration"] | 10000;
   weatherDuration = doc["weatherDuration"] | 5000;
+  dateDuration = doc["dateDuration"] | weatherDuration;
   strlcpy(timeZone, doc["timeZone"] | "Etc/UTC", sizeof(timeZone));
   if (doc["language"].is<const char *>()) {
     strlcpy(language, doc["language"], sizeof(language));
@@ -1437,6 +1431,7 @@ void setupWebServer() {
       if (n == "brightness") doc[n] = v.toInt();
       else if (n == "clockDuration") doc[n] = v.toInt();
       else if (n == "weatherDuration") doc[n] = v.toInt();
+      else if (n == "dateDuration") doc[n] = v.toInt();
       else if (n == "flipDisplay") doc[n] = (v == "true" || v == "on" || v == "1");
       else if (n == "twelveHourToggle") doc[n] = (v == "true" || v == "on" || v == "1");
       else if (n == "showDayOfWeek") doc[n] = (v == "true" || v == "on" || v == "1");
@@ -1948,6 +1943,7 @@ void setupWebServer() {
       case 4:
         if (snsType == SNS_YOUTUBE) doc["mode"] = "youtube";
         else if (snsType == SNS_INSTAGRAM) doc["mode"] = "instagram";
+        else if (snsType == SNS_RSS) doc["mode"] = "rss";
         else doc["mode"] = "nightscout";
         break;
       case 5: doc["mode"] = "date"; break;
@@ -1994,23 +1990,26 @@ void setupWebServer() {
     // --- Weather ---
     JsonObject weather = doc["weather"].to<JsonObject>();
 
-    if (weatherAvailable && weatherDescription.length() > 0) {
+    if (weatherAvailable && currentTemp.length() > 0) {
       weather["currentTemperature"] = String(currentTemp).toInt();
-      weather["weatherDescription"] = weatherDescription;
-      weather["icon"] = weatherIcon;
     } else {
       weather["currentTemperature"] = JsonVariant();
-      weather["weatherDescription"] = JsonVariant();
-      weather["icon"] = JsonVariant();
     }
-
-    weather["currentHumidity"] = (weatherAvailable && weatherDescription.length() > 0) ? currentHumidity : JsonVariant();
+    weather["weatherDescription"] = (weatherAvailable && weatherDescription.length() > 0)
+                                      ? weatherDescription : JsonVariant();
+    weather["icon"] = (weatherAvailable && weatherIcon.length() > 0)
+                        ? weatherIcon : JsonVariant();
+    weather["currentHumidity"] = (weatherAvailable && currentHumidity >= 0)
+                                   ? currentHumidity : JsonVariant();
+    weather["fresh"] = weatherFetched;
     weather["sunriseHour"] = weatherAvailable ? sunriseHour : JsonVariant();
     weather["sunriseMinute"] = weatherAvailable ? sunriseMinute : JsonVariant();
     weather["sunsetHour"] = weatherAvailable ? sunsetHour : JsonVariant();
     weather["sunsetMinute"] = weatherAvailable ? sunsetMinute : JsonVariant();
-    weather["apparentTemperature"] = apparentTemperature.length() > 0 ? String(apparentTemperature).toInt() : JsonVariant();
-    weather["weatherCode"] = currentWeatherCode >= 0 ? currentWeatherCode : JsonVariant();
+    weather["apparentTemperature"] = (weatherAvailable && apparentTemperature.length() > 0)
+                                         ? String(apparentTemperature).toInt() : JsonVariant();
+    weather["weatherCode"] = (weatherAvailable && currentWeatherCode >= 0)
+                               ? currentWeatherCode : JsonVariant();
     weather["provider"] = String(weatherProvider);
 
     // --- Nightscout info ---
@@ -2059,6 +2058,7 @@ void setupWebServer() {
     config["weatherLongitude"] = String(weatherLongitude);
     config["clockDuration"] = clockDuration;
     config["weatherDuration"] = weatherDuration;
+    config["dateDuration"] = dateDuration;
     config["timeZone"] = String(timeZone);
     config["language"] = String(language);
     config["flipDisplay"] = flipDisplay;
@@ -2997,6 +2997,11 @@ bool handleTimerCommand(String cmd) {
   return false;
 }
 
+void scheduleRuntimeConfigSave() {
+  configDirty = true;
+  lastBrightnessChange = millis();
+}
+
 //Actions handler
 void executeAction(const String &action, const String &value) {
   if (value.length() > 0) {
@@ -3036,34 +3041,41 @@ void executeAction(const String &action, const String &value) {
     flipDisplay = hasValue ? boolVal : !flipDisplay;
     P.setZoneEffect(0, flipDisplay, PA_FLIP_UD);
     P.setZoneEffect(0, flipDisplay, PA_FLIP_LR);
+    scheduleRuntimeConfigSave();
 
   } else if (action == "twelvehour" || action == "twelve_hour") {
     twelveHourToggle = hasValue ? boolVal : !twelveHourToggle;
     if (!hasValue && displayMode != 0) { goToMode("0"); }
+    scheduleRuntimeConfigSave();
 
   } else if (action == "dayofweek" || action == "show_dayofweek") {
     showDayOfWeek = hasValue ? boolVal : !showDayOfWeek;
     if (!hasValue && displayMode != 0) { goToMode("0"); }
+    scheduleRuntimeConfigSave();
 
   } else if (action == "showdate" || action == "show_date") {
     bool newVal = hasValue ? boolVal : !showDate;
     if (showDate && !newVal && displayMode == 5) { advanceDisplayMode(true); }
     showDate = newVal;
     if (!hasValue && showDate) { goToMode("5"); }
+    scheduleRuntimeConfigSave();
 
   } else if (action == "colon_blink" || action == "animated_seconds") {
     colonBlinkEnabled = hasValue ? boolVal : !colonBlinkEnabled;
     if (!hasValue && displayMode != 0) { goToMode("0"); }
+    scheduleRuntimeConfigSave();
 
   } else if (action == "humidity" || action == "show_humidity") {
     showHumidity = hasValue ? boolVal : !showHumidity;
     if (!hasValue) { goToMode("1"); }  // show the change on weather
+    scheduleRuntimeConfigSave();
 
   } else if (action == "weatherdesc" || action == "show_weather_desc") {
     bool newVal = hasValue ? boolVal : !showWeatherDescription;
     if (showWeatherDescription && !newVal && displayMode == 2) { advanceDisplayMode(true); }
     showWeatherDescription = newVal;
     if (!hasValue && showWeatherDescription) { goToMode("2"); }  // only jump when turning ON
+    scheduleRuntimeConfigSave();
 
   } else if (action == "units" || action == "imperial") {
     bool isImperial = (action == "imperial") ? (!hasValue ? true : boolVal) : (hasValue ? boolVal : strcmp(weatherUnits, "imperial") != 0);
@@ -3076,12 +3088,14 @@ void executeAction(const String &action, const String &value) {
     }
     networkData.requestWeatherRefresh();
     if (!hasValue) { goToMode("1"); }  // show the change on weather
+    scheduleRuntimeConfigSave();
 
   } else if (action == "metric") {
     strcpy(weatherUnits, "metric");
     tempSymbol = '\006';
     networkData.requestWeatherRefresh();
     if (!hasValue) { goToMode("1"); }  // show the change on weather
+    scheduleRuntimeConfigSave();
 
   } else if (action == "countdown_enabled" || action == "countdown") {
     bool newVal = hasValue ? boolVal : !countdownEnabled;
@@ -3097,7 +3111,7 @@ void executeAction(const String &action, const String &value) {
 
   } else if (action == "clock_only_dimming") {
     clockOnlyDuringDimming = hasValue ? boolVal : !clockOnlyDuringDimming;
-    configDirty = true;
+    scheduleRuntimeConfigSave();
 
   } else if (action == "go_to_mode") {
     goToMode(value);
@@ -3162,6 +3176,7 @@ void executeAction(const String &action, const String &value) {
     strlcpy(language, lang.c_str(), sizeof(language));
     networkData.requestWeatherRefresh();
     advanceDisplayMode();
+    scheduleRuntimeConfigSave();
 
   } else if (action == "clear_message") {
     allowInterrupt = true;
@@ -3228,22 +3243,23 @@ void handleBrightnessChange(int newBrightness, bool isFromUI) {
   }
 }
 
+void resetModeRenderState() {
+  clockScrollDone = false;
+  descScrolling = false;
+  descScrollEndTime = 0;
+  descStartTime = 0;
+}
+
 void goToMode(const String &target) {
-  int targetMode = -1;
-  String v = target;
-  v.toLowerCase();
+  DisplayMode parsedMode;
+  if (!parseDisplayMode(target, parsedMode)) {
+    Serial.printf("[DISPLAY] go_to_mode: invalid target '%s'\n", target.c_str());
+    return;
+  }
 
-  if (v == "0" || v == "clock") targetMode = 0;
-  else if (v == "1" || v == "weather") targetMode = 1;
-  else if (v == "2" || v == "weather_desc") targetMode = 2;
-  else if (v == "3" || v == "countdown") targetMode = 3;
-  else if (v == "4" || v == "nightscout" || v == "bridge") targetMode = 4;
-  else if (v == "5" || v == "date") targetMode = 5;
-  else if (v == "6" || v == "message") targetMode = 6;
-  else if (v == "7" || v == "timer") targetMode = 7;
-
-  if (targetMode == -1 || !isModeAvailable(targetMode)) {
-    Serial.printf("[DISPLAY] go_to_mode: invalid or unavailable target '%s'\n", target.c_str());
+  const int targetMode = displayModeId(parsedMode);
+  if (!isModeAvailable(parsedMode)) {
+    Serial.printf("[DISPLAY] go_to_mode: unavailable target '%s'\n", target.c_str());
     return;
   }
 
@@ -3255,8 +3271,7 @@ void goToMode(const String &target) {
     hourglassPlayed = false;
   }
 
-  prevDisplayMode = displayMode;  // general line already there
-  displayMode = targetMode;
+  displayController.select(parsedMode, millis());
 
   // ---- RESET TARGET MODE STATE ----
   if (targetMode == 0) {
@@ -3280,22 +3295,12 @@ void goToMode(const String &target) {
     hourglassPlayed = false;
   }
 
-  // ---- SYNC modeIndex ----
-  for (int i = 0; i < MODE_COUNT; i++) {
-    if (modeOrder[i] == displayMode) {
-      modeIndex = i;
-      break;
-    }
-  }
 
-  // ---- RESET SCROLL STATE ----
-  clockScrollDone = false;
-  descScrolling = false;
-  descScrollEndTime = 0;
+  resetModeRenderState();
 
-  const char *modeNames[] = { "CLOCK", "WEATHER", "WEATHER DESC", "COUNTDOWN", "BRIDGE", "DATE", "CUSTOM MESSAGE", "TIMER" };
-  Serial.printf("[DISPLAY] go_to_mode: %s (from %s)\n", modeNames[targetMode], modeNames[prevDisplayMode]);
-  lastSwitch = millis();
+  const char *previousName = (prevDisplayMode >= 0 && prevDisplayMode < 8)
+                               ? displayModeName(displayModeFromId(prevDisplayMode)) : "UNKNOWN";
+  Serial.printf("[DISPLAY] go_to_mode: %s (from %s)\n", displayModeName(parsedMode), previousName);
 }
 
 
@@ -3491,13 +3496,7 @@ void setup() {
 
 void advanceDisplayMode(bool forced) {
   if (!rotationEnabled && !forced) return;
-  // Sync modeIndex to current displayMode position before going backwards
-  for (int i = 0; i < MODE_COUNT; i++) {
-    if (modeOrder[i] == displayMode) {
-      modeIndex = i;
-      break;
-    }
-  }
+  displayController.syncRotationIndex();
   // ---- DIMMING LOCK ----
   if (clockOnlyDuringDimming && dimActive) {
     if (displayMode != 0) {
@@ -3543,15 +3542,11 @@ void advanceDisplayMode(bool forced) {
     segmentStartTime = 0;
   }
 
-  prevDisplayMode = displayMode;
 
   // ---- SAFE ROTATION ENGINE ----
-  for (int i = 0; i < MODE_COUNT; i++) {
-    modeIndex++;
-    if (modeIndex >= MODE_COUNT)
-      modeIndex = 0;
-
-    int nextMode = modeOrder[modeIndex];
+  for (size_t i = 0; i < kDisplayModeOrderCount; i++) {
+    const DisplayMode nextDisplayMode = displayController.nextCandidate();
+    const int nextMode = displayModeId(nextDisplayMode);
 
     // --- Bridge mode throttle (YouTube, Nightscout, and RSS) ---
     if (nextMode == 4) {
@@ -3563,23 +3558,20 @@ void advanceDisplayMode(bool forced) {
       bridgeRotationCount++;
     }
 
-    if (isModeAvailable(nextMode)) {
+    if (isModeAvailable(nextDisplayMode)) {
       if (displayMode == 6 || displayMode == 2 || displayMode == 3) {
         // P.displayReset();
         // P.displayClear();
       }
 
-      displayMode = nextMode;
+      displayController.select(nextDisplayMode, millis());
 
-      const char *modeNames[] = { "CLOCK", "WEATHER", "WEATHER DESC", "COUNTDOWN", "BRIDGE", "DATE", "CUSTOM MESSAGE", "TIMER" };
-      const char *newName = displayMode < 8 ? modeNames[displayMode] : "UNKNOWN";
-      const char *prevName = prevDisplayMode < 8 ? modeNames[prevDisplayMode] : "UNKNOWN";
-      Serial.printf("[DISPLAY] Switching to display mode: %s (from %s)\n", newName, prevName);
+      const char *previousName = (prevDisplayMode >= 0 && prevDisplayMode < 8)
+                                   ? displayModeName(displayModeFromId(prevDisplayMode)) : "UNKNOWN";
+      Serial.printf("[DISPLAY] Switching to display mode: %s (from %s)\n",
+                    displayModeName(nextDisplayMode), previousName);
 
-      clockScrollDone = false;
-      descScrolling = false;
-      descScrollEndTime = 0;
-      lastSwitch = millis();
+      resetModeRenderState();
       return;
     }
   }
@@ -3591,13 +3583,7 @@ void advanceDisplayMode(bool forced) {
 
 void previousDisplayMode(bool forced) {
   if (!rotationEnabled && !forced) return;
-  // Sync modeIndex to current displayMode position before going backwards
-  for (int i = 0; i < MODE_COUNT; i++) {
-    if (modeOrder[i] == displayMode) {
-      modeIndex = i;
-      break;
-    }
-  }
+  displayController.syncRotationIndex();
   if (clockOnlyDuringDimming && dimActive) {
     displayMode = 0;
     return;
@@ -3608,33 +3594,25 @@ void previousDisplayMode(bool forced) {
     segmentStartTime = 0;
   }
 
-  prevDisplayMode = displayMode;
 
-  for (int i = 0; i < MODE_COUNT; i++) {
-    if (modeIndex == 0)
-      modeIndex = MODE_COUNT - 1;
-    else
-      modeIndex--;
+  for (size_t i = 0; i < kDisplayModeOrderCount; i++) {
+    const DisplayMode nextDisplayMode = displayController.previousCandidate();
+    const int nextMode = displayModeId(nextDisplayMode);
 
-    int nextMode = modeOrder[modeIndex];
-
-    if (isModeAvailable(nextMode)) {
+    if (isModeAvailable(nextDisplayMode)) {
       if (displayMode == 6 || displayMode == 2 || displayMode == 3) {
         P.displayReset();
         P.displayClear();
       }
 
-      displayMode = nextMode;
+      displayController.select(nextDisplayMode, millis());
 
-      const char *modeNames[] = { "CLOCK", "WEATHER", "WEATHER DESC", "COUNTDOWN", "BRIDGE", "DATE", "CUSTOM MESSAGE", "TIMER" };
-      const char *newName = displayMode < 8 ? modeNames[displayMode] : "UNKNOWN";
-      const char *prevName = prevDisplayMode < 8 ? modeNames[prevDisplayMode] : "UNKNOWN";
-      Serial.printf("[DISPLAY] Switching to display mode: %s (from %s)\n", newName, prevName);
+      const char *previousName = (prevDisplayMode >= 0 && prevDisplayMode < 8)
+                                   ? displayModeName(displayModeFromId(prevDisplayMode)) : "UNKNOWN";
+      Serial.printf("[DISPLAY] Switching to display mode: %s (from %s)\n",
+                    displayModeName(nextDisplayMode), previousName);
 
-      clockScrollDone = false;
-      descScrolling = false;
-      descScrollEndTime = 0;
-      lastSwitch = millis();
+      resetModeRenderState();
       return;
     }
   }
@@ -3643,18 +3621,30 @@ void previousDisplayMode(bool forced) {
   Serial.println(F("[DISPLAY] Fallback to CLOCK"));
 }
 
-bool isModeAvailable(int mode) {
-  SnsType snsType = detectSnsType(String(ntpServer2));
+bool isModeAvailable(DisplayMode mode) {
+  const SnsType snsType = detectSnsType(String(ntpServer2));
   switch (mode) {
-    case 0: return true;  // CLOCK always available
-    case 1: return weatherAvailable && weatherConfigurationValid();
-    case 2: return showWeatherDescription && weatherAvailable && weatherDescription.length() > 0;
-    case 3: return countdownEnabled && !countdownFinished && ntpSyncSuccessful;
-    case 4: return snsType != SNS_NTP;  // nightscout, youtube, or instagram all use mode 4
-    case 5: return showDate;
-    case 6: return strlen(customMessage) > 0;
+    case DisplayMode::Clock: return true;
+    case DisplayMode::Weather: return weatherConfigurationValid();
+    case DisplayMode::WeatherDescription:
+      return showWeatherDescription && weatherAvailable && weatherDescription.length() > 0;
+    case DisplayMode::Countdown:
+      return countdownEnabled && !countdownFinished && ntpSyncSuccessful;
+    case DisplayMode::Bridge: return snsType != SNS_NTP;
+    case DisplayMode::Date: return showDate && ntpSyncSuccessful;
+    case DisplayMode::Message: return strlen(customMessage) > 0;
+    case DisplayMode::Timer: return timerActive;
   }
   return false;
+}
+
+unsigned long displayModeDuration(DisplayMode mode) {
+  switch (mode) {
+    case DisplayMode::Clock: return clockDuration;
+    case DisplayMode::Weather: return weatherDuration;
+    case DisplayMode::Date: return dateDuration;
+    default: return 0;
+  }
 }
 
 //config save after countdown finishes
@@ -3729,6 +3719,9 @@ bool saveConfigRuntime() {
   doc["showHumidity"] = showHumidity;
   doc["colonBlinkEnabled"] = colonBlinkEnabled;
   doc["clockOnlyDuringDimming"] = clockOnlyDuringDimming;
+  doc["showWeatherDescription"] = showWeatherDescription;
+  doc["weatherUnits"] = weatherUnits;
+  doc["language"] = language;
 
   File configFileWrite = LittleFS.open("/config.json", "w");
   if (!configFileWrite) {
@@ -3742,47 +3735,6 @@ bool saveConfigRuntime() {
   Serial.println(F("[CONFIG] Runtime config saved"));
   return true;
 }
-
-//Custom font format for days
-String getFormattedDateText(const char *rawText) {
-  String input = String(rawText);
-  String output = "";
-
-  // 1. Detect if it's Japanese/Multi-byte
-  bool isMultiByte = false;
-  for (int i = 0; i < input.length(); i++) {
-    if ((uint8_t)input[i] > 127) {
-      isMultiByte = true;
-      break;
-    }
-  }
-
-  if (isMultiByte) {
-    // Keep Japanese symbols as they are (e.g., "³")
-    output = input;
-  } else {
-    // Determine the separator: \016 for custom, " " for standard
-    String separator = useCustomFont ? "\016" : " ";
-
-    // If standard font, convert to uppercase first (e.g., "tue" -> "TUE")
-    if (!useCustomFont) {
-      input.toUpperCase();
-    }
-
-    // 2. Inject the separator between characters
-    for (int i = 0; i < input.length(); i++) {
-      output += input[i];
-      if (i < input.length() - 1) {
-        output += separator;
-      }
-    }
-  }
-
-  // 3. Add the trailing spaces (M\016O\016N   or T U E  )
-  output += "  ";
-  return output;
-}
-
 
 void loop() {
   handleButtons();
@@ -4092,13 +4044,6 @@ void loop() {
   }
 
 
-  // Only advance mode by timer for clock/weather, not description!
-  unsigned long displayDuration = (displayMode == 0) ? clockDuration : weatherDuration;
-  if (rotationEnabled && (displayMode == 0 || displayMode == 1) && millis() - lastSwitch > displayDuration) {
-    advanceDisplayMode();
-  }
-
-
   // --- OUTBOUND DATA SERVICES ---
   static WeatherRequest weatherRequest;
   const WeatherProvider configuredProvider = parseWeatherProvider(String(weatherProvider));
@@ -4138,7 +4083,10 @@ void loop() {
       mainDesc = weather.mainDescription;
       detailedDesc = weather.detailedDescription;
       weatherIcon = weather.icon;
-      weatherDescription = weatherIcon + " " + cleanTextForDisplay(detailedDesc);
+      const String cleanedDescription = cleanTextForDisplay(detailedDesc);
+      weatherDescription = weatherIcon;
+      if (weatherDescription.length() > 0 && cleanedDescription.length() > 0) weatherDescription += " ";
+      weatherDescription += cleanedDescription;
       sunriseHour = weather.sunriseHour;
       sunriseMinute = weather.sunriseMinute;
       sunsetHour = weather.sunsetHour;
@@ -4165,65 +4113,21 @@ void loop() {
     rssTitle = sns.rssTitle;
   }
 
-  const char *const *daysOfTheWeek = getDaysOfWeek(language);
-  // Call our new formatting function
-  String daySymbol = getFormattedDateText(daysOfTheWeek[timeinfo.tm_wday]);
-
-
-  // build base HH:MM first ---
-  char baseTime[9];
-  if (twelveHourToggle) {
-    int hour12 = timeinfo.tm_hour % 12;
-    if (hour12 == 0) hour12 = 12;
-    sprintf(baseTime, "%d:%02d", hour12, timeinfo.tm_min);
-  } else {
-    sprintf(baseTime, "%02d:%02d", timeinfo.tm_hour, timeinfo.tm_min);
+  // Run deferred config writes before mode renderers, many of which return early.
+  if (configDirty && millis() - lastBrightnessChange > saveDelay) {
+    saveConfigRuntime();
+    configDirty = false;
+    Serial.println(F("[CONFIG] Auto-saved"));
   }
 
-  // add seconds only if colon blink enabled AND weekday hidden ---
-  char timeWithSeconds[12];
-  if (!showDayOfWeek && colonBlinkEnabled) {
-    // Remove any leading space from baseTime
-    const char *trimmedBase = baseTime;
-    if (baseTime[0] == ' ') trimmedBase++;  // skip leading space
-    sprintf(timeWithSeconds, "%s:%02d", trimmedBase, timeinfo.tm_sec);
-  } else if (!showDayOfWeek && !colonBlinkEnabled) {
-    sprintf(timeWithSeconds, "  %s  ", baseTime);
-  } else {
-    strcpy(timeWithSeconds, baseTime);  // no seconds
-  }
+  const String formattedTime = formatClockText(
+    timeinfo, language, twelveHourToggle, showDayOfWeek, colonBlinkEnabled,
+    colonVisible, useCustomFont);
 
-  // keep spacing logic the same ---
-  char timeSpacedStr[24];
-  int j = 0;
-  for (int i = 0; timeWithSeconds[i] != '\0'; i++) {
-    timeSpacedStr[j++] = timeWithSeconds[i];
-    if (timeWithSeconds[i + 1] != '\0') {
-      timeSpacedStr[j++] = ' ';
-    }
-  }
-  timeSpacedStr[j] = '\0';
-
-  // build final string ---
-  String formattedTime;
-  if (showDayOfWeek) {
-    // daySymbol now has either "t\016u\016e  " or "T U E  "
-    // In both cases, the padding is already inside daySymbol.
-    formattedTime = daySymbol + String(timeSpacedStr);
-  } else {
-    formattedTime = String(timeSpacedStr);
-  }
-
-  unsigned long currentDisplayDuration = 0;
-  if (displayMode == 0) {
-    currentDisplayDuration = clockDuration;
-  } else if (displayMode == 1) {  // Weather
-    currentDisplayDuration = weatherDuration;
-  }
-
-  // Only advance mode by timer for clock/weather static (Mode 0 & 1).
-  // Other modes (2, 3) have their own internal timers/conditions for advancement.
-  if (rotationEnabled && (displayMode == 0 || displayMode == 1) && (millis() - lastSwitch > currentDisplayDuration)) {
+  const DisplayMode activeMode = displayModeFromId(displayMode);
+  const unsigned long activeModeDuration = displayModeDuration(activeMode);
+  if (rotationEnabled && activeModeDuration > 0 &&
+      millis() - lastSwitch > activeModeDuration) {
     advanceDisplayMode();
   }
 
@@ -4359,13 +4263,8 @@ void loop() {
     P.setCharSpacing(1);
     P.setTextAlignment(PA_CENTER);
     if (weatherAvailable) {
-      String weatherDisplay;
-      if (showHumidity && currentHumidity != -1) {
-        int cappedHumidity = (currentHumidity > 99) ? 99 : currentHumidity;
-        weatherDisplay = currentTemp + " " + String(cappedHumidity) + "%";
-      } else {
-        weatherDisplay = currentTemp + tempSymbol;
-      }
+      const String weatherDisplay = formatWeatherText(
+        currentTemp, currentHumidity, showHumidity, tempSymbol);
       P.print(weatherDisplay.c_str());
       weatherWasAvailable = true;
     } else {
@@ -4389,8 +4288,17 @@ void loop() {
   }
 
 
+  // Active description may become unavailable after a weather refresh failure or
+  // runtime setting change. Never leave a self-timed mode without an exit path.
+  if (displayMode == displayModeId(DisplayMode::WeatherDescription) &&
+      !isModeAvailable(DisplayMode::WeatherDescription)) {
+    advanceDisplayMode(true);
+    yield();
+    return;
+  }
+
   // --- WEATHER DESCRIPTION Display Mode ---
-  if (displayMode == 2 && showWeatherDescription && weatherAvailable && weatherDescription.length() > 0) {
+  if (displayMode == 2) {
     P.setCharSpacing(1);
     P.setTextAlignment(PA_CENTER);
     if (forceMessageRestart) return;
@@ -5031,57 +4939,16 @@ void loop() {
   else if (displayMode == 5 && showDate) {
     if (forceMessageRestart) return;
 
-    if (timeinfo.tm_year < 120 || timeinfo.tm_mday <= 0 || timeinfo.tm_mon < 0 || timeinfo.tm_mon > 11) {
-      advanceDisplayMode();
+    if (!validDisplayDate(timeinfo)) {
+      advanceDisplayMode(true);
       return;
     }
 
-    // 1. Month uses the custom font logic (lowercase + \016)
-    const char *const *months = getMonthsOfYear(language);
-    String monthAbbr = getFormattedDateText(months[timeinfo.tm_mon]);
-
-    // 2. Day digits ALWAYS use standard spaces (" "), never the custom \016
-    String dayString = String(timeinfo.tm_mday);
-    String spacedDay = "";
-    for (size_t i = 0; i < dayString.length(); i++) {
-      spacedDay += dayString[i];
-      if (i < dayString.length() - 1) {
-        spacedDay += " ";  // Hardcoded standard space
-      }
-    }
-
-    String dateString;
-    String langStr = String(language);
-
-    if (langStr == "ja") {
-      // Japanese: "1 ²  2 4 ±"
-      dateString = monthAbbr + spacedDay + " ±";
-    } else {
-      auto isDayFirst = [](const String &lang) {
-        const char *dayFirstLangs[] = { "af", "cs", "da", "de", "eo", "es", "et", "fi", "fr", "ga", "hr", "hu", "it", "lt", "lv", "nl", "no", "pl", "pt", "ro", "ru", "sk", "sl", "sr", "sv", "sw", "tr" };
-        for (auto lf : dayFirstLangs) {
-          if (lang.equalsIgnoreCase(lf)) return true;
-        }
-        return false;
-      };
-
-      // monthAbbr already has trailing "  " from your function
-      if (isDayFirst(langStr)) {
-        // Result: "2 4  f\016e\016b  "
-        dateString = spacedDay + "  " + monthAbbr;
-      } else {
-        // Result: "f\016e\016b  2 4"
-        dateString = monthAbbr + spacedDay;
-      }
-    }
+    const String dateString = formatDateText(timeinfo, language, useCustomFont);
 
     P.setTextAlignment(PA_CENTER);
     P.setCharSpacing(0);
     P.print(dateString.c_str());
-
-    if (millis() - lastSwitch > weatherDuration) {
-      advanceDisplayMode();
-    }
   }
 
 
@@ -5257,12 +5124,6 @@ void loop() {
   // --- Log and save uptime every 10 minutes ---
   const unsigned long uptimeLogInterval = 600000UL;  // 10 minutes in ms
 
-  // ---- CONFIG AUTO SAVE ----
-  if (configDirty && millis() - lastBrightnessChange > saveDelay) {
-    saveConfigRuntime();
-    configDirty = false;
-    Serial.println("[CONFIG] Auto-saved");
-  }
 
   if (currentMillis - lastUptimeLog >= uptimeLogInterval) {
     lastUptimeLog = currentMillis;

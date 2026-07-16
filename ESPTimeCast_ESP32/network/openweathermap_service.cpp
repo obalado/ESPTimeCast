@@ -119,6 +119,9 @@ NetworkResult OpenWeatherMapService::fetch(const WeatherRequest &request, Weathe
   output.provider = "openweathermap";
   output.apparentTemperature = "";
   output.weatherCode = -1;
+  output.mainDescription = "";
+  output.detailedDescription = "";
+  output.icon = "";
   Serial.printf("[WEATHER] Temp: %d°\n", static_cast<int>(round(temperature)));
 
   if (document[F("main")][F("humidity")].is<int>()) {

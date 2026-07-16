@@ -305,7 +305,7 @@ Click the **cog icon** next to “Advanced Settings” in the Web UI to reveal e
 - **Secondary NTP Server**: Fallback NTP server (e.g. `time.nist.gov`)
 - **Day of the Week**: Display Day of the Week in the desired language
 - **Blinking Colon** toggle (default is on)
-- **Show Date** (default is off, duration is the same as weather duration)
+- **Show Date** (default is off, with an independent configurable duration)
 - **24/12h Clock**: Switch between 24-hour and 12-hour time formats (24-hour default)
 - **Imperial Units (°F)** toggle (metric °C defaults)
 - **Humidity**: Display Humidity besides Temperature
@@ -490,7 +490,7 @@ POST http://<device_ip>/action
 |-----------|-------|-------------|
 | `next_mode` | -- | Advance to next display mode |
 | `prev_mode` | -- | Go to previous display mode |
-| `go_to_mode` | `0`–`6` or name | Jump to a mode: `clock`, `weather`, `description`, `countdown`, `date`, `nightscout`, `message` |
+| `go_to_mode` | `0`–`7` or name | Jump to an available mode: `clock`, `weather`, `description`/`weather_desc`, `countdown`, `bridge`/`nightscout`, `date`, `message`, `timer` |
 | `enable_rotation` | `0` or `1` (optional) | Freeze or resume automatic rotation. Toggles if no value sent. |
 
 #### 🔆 Display & Brightness
@@ -1111,8 +1111,8 @@ http://your-device-ip/upload
 <summary>📺 How the Display Works</summary>
 &nbsp;
 
-**ESPTimeCast™** automatically switches between two display modes: Clock and Weather.
-If "Show Weather Description" is enabled, a third mode (Description) will display with a duration of 3 seconds, if the description is too long to fit on the display the description will scroll from right to left once.
+**ESPTimeCast™** rotates through available modes in this order: Clock, Date, Weather, Description, Countdown, Bridge, and Custom Message. Disabled or unavailable modes are skipped; Timer temporarily overrides rotation while active.
+If "Show Weather Description" is enabled, Description displays for 3 seconds when short. Long descriptions scroll from right to left once.
 
 What you see on the LED matrix depends on whether the device has successfully fetched current time via NTP and weather from the selected provider.
 The following table summarizes what will appear on the display in each scenario:
@@ -1127,8 +1127,8 @@ The following table summarizes what will appear on the display in each scenario:
 
 #### How it works:
 
-- The display automatically alternates between **Clock** and **Weather** modes (the duration for each is configurable).
-- If "Show Weather Description" is enabled a third mode **Description** will display after the **Weather** display with a duration of 3 seconds.
+- Clock and Weather use independently configurable durations. Date also has its own duration.
+- Enabled Date appears after Clock. Enabled Description appears after Weather and displays for 3 seconds or one complete scroll.
 - In **Clock** mode, if NTP time is available, you’ll see the current time plus a unique day-of-week icon. If NTP is not available, you'll see `! NTP`.
 - In **Weather** mode, if weather is available, you’ll see the temperature (like `23ºC`). If weather is not available but time is, it falls back to showing the clock. If neither is available, you’ll see `! TEMP`.
 - All status/error messages (`! NTP`, `! TEMP`) are big icons shown on the display.

@@ -1,8 +1,18 @@
 #include "network_data_coordinator.h"
 
 #include <WiFi.h>
+#include <new>
 
 #include "../services/sns_utils.h"
+
+namespace {
+struct WeatherTaskContext {
+  NetworkDataCoordinator *owner;
+  WeatherRequest request;
+  WeatherData candidate;
+  NetworkResult result;
+};
+}
 
 void NetworkDataCoordinator::initialize(const WeatherData &weatherData) {
   weatherData_ = weatherData;
@@ -24,9 +34,14 @@ void NetworkDataCoordinator::configure(const WeatherRequest &weatherRequest, con
 }
 
 void NetworkDataCoordinator::update(bool connected, bool timeSynchronized, unsigned long connectedAt) {
+  collectWeatherResult();
   if (!connected) {
     weatherFetchInitiated_ = false;
     weatherRefreshRequested_ = false;
+    if (weatherData_.fetched) {
+      weatherData_.fetched = false;
+      weatherChanged_ = true;
+    }
     return;
   }
 
@@ -77,7 +92,25 @@ const SnsData &NetworkDataCoordinator::sns() const {
 }
 
 void NetworkDataCoordinator::updateWeather(unsigned long now, unsigned long connectedAt) {
-  if (weatherFetchInitiated_ && !weatherRefreshRequested_ && now - lastWeatherFetch_ <= kWeatherInterval) return;
+  // Do not count connection-stabilization time as a fetch attempt. Otherwise the
+  // initial request is postponed for the full refresh interval.
+  if (now - connectedAt < 5000 || weatherTaskRunning_) return;
+
+  if (weatherFetchInitiated_ && !weatherRefreshRequested_ &&
+      now - lastWeatherFetch_ < kWeatherInterval) return;
+  if (!gate_.tryAcquire()) return;
+
+  WeatherTaskContext *context = new (std::nothrow) WeatherTaskContext{
+    this, weatherRequest_, weatherData_, {}
+  };
+  if (context == nullptr) {
+    Serial.println(F("[WEATHER] Failed to allocate async request context."));
+    weatherRefreshRequested_ = false;
+    weatherFetchInitiated_ = true;
+    lastWeatherFetch_ = millis() - kWeatherInterval + 30000UL;
+    gate_.release();
+    return;
+  }
 
   if (weatherRefreshRequested_) Serial.println(F("[LOOP] Immediate weather fetch requested by web server."));
   else if (!weatherFetchInitiated_) Serial.println(F("[LOOP] Initial weather fetch."));
@@ -85,28 +118,53 @@ void NetworkDataCoordinator::updateWeather(unsigned long now, unsigned long conn
 
   weatherRefreshRequested_ = false;
   weatherFetchInitiated_ = true;
+  weatherTaskRunning_ = true;
   weatherData_.fetched = false;
+  weatherChanged_ = true;
 
-  if (now - connectedAt < 5000) {
-    Serial.println(F("[WEATHER] Skipped: Network just reconnected. Letting it stabilize..."));
-    lastWeatherFetch_ = now;
-    weatherChanged_ = true;
-    return;
+  const BaseType_t created = xTaskCreate(
+    weatherTaskEntry, "weather-fetch", 12288, context, 1, nullptr);
+  if (created != pdPASS) {
+    Serial.println(F("[WEATHER] Failed to create async request task."));
+    delete context;
+    weatherTaskRunning_ = false;
+    lastWeatherFetch_ = millis() - kWeatherInterval + 30000UL;
+    gate_.release();
   }
-  if (!gate_.tryAcquire()) return;
+}
 
-  WeatherData candidate = weatherData_;
-  const NetworkResult result = weatherService_.fetch(weatherRequest_, candidate);
+void NetworkDataCoordinator::weatherTaskEntry(void *parameter) {
+  WeatherTaskContext *context = static_cast<WeatherTaskContext *>(parameter);
+  context->result = context->owner->weatherService_.fetch(context->request, context->candidate);
+
+  portENTER_CRITICAL(&context->owner->weatherResultMux_);
+  context->owner->pendingWeatherResult_ = context;
+  portEXIT_CRITICAL(&context->owner->weatherResultMux_);
+
+  vTaskDelete(nullptr);
+}
+
+void NetworkDataCoordinator::collectWeatherResult() {
+  WeatherTaskContext *context = nullptr;
+  portENTER_CRITICAL(&weatherResultMux_);
+  context = static_cast<WeatherTaskContext *>(pendingWeatherResult_);
+  pendingWeatherResult_ = nullptr;
+  portEXIT_CRITICAL(&weatherResultMux_);
+  if (context == nullptr) return;
+
   gate_.release();
+  weatherTaskRunning_ = false;
   lastWeatherFetch_ = millis();
 
-  if (result.ok()) {
-    weatherData_ = candidate;
+  if (context->result.ok()) {
+    weatherData_ = context->candidate;
   } else {
-    weatherData_.available = false;
+    // Keep last successful snapshot available. Display can continue showing stale
+    // data until next refresh instead of disappearing after one transient error.
     weatherData_.fetched = false;
   }
   weatherChanged_ = true;
+  delete context;
 }
 
 void NetworkDataCoordinator::updateNightscout(unsigned long now, SnsType type) {
